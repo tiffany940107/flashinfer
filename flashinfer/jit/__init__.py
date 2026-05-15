@@ -97,6 +97,9 @@ from .fp4_kv_dequantization import (
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .nvfp4_attention import (
+    gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
+)
 
 
 cuda_lib_path = os.environ.get(

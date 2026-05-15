@@ -121,6 +121,9 @@ from .norm import gemma_rmsnorm as gemma_rmsnorm
 from .norm import rmsnorm as rmsnorm
 from .norm import rmsnorm_quant as rmsnorm_quant
 from .norm import fused_rmsnorm_silu as fused_rmsnorm_silu
+from . import nvfp4_attention as nvfp4_attention
+from .nvfp4_attention import nvfp4_attention_fwd as nvfp4_attention_fwd
+from .nvfp4_attention import nvfp4_attention_quantize_qkv as nvfp4_attention_quantize_qkv
 
 try:
     from .norm import rmsnorm_fp4quant as rmsnorm_fp4quant
