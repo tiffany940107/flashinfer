@@ -54,14 +54,16 @@ struct _2SM;
 template <>
 struct SMTypeAdapter<_1SM> {
   static int const Scale = 1;
-  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
+  using TmaEpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
+  using NoSmemEpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized1Sm;
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized1SmSm100;
 };
 
 template <>
 struct SMTypeAdapter<_2SM> {
   static int const Scale = 2;
-  using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
+  using TmaEpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
+  using NoSmemEpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized2Sm;
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmSm100;
 };
 
@@ -124,7 +126,17 @@ size_t genericFp8GemmKernelLauncherSm100(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 c
                                 cute::Int<CTA_K_>>;  // Threadblock-level tile size
 
   using ClusterShape = ClusterShape_;  // Shape of the threadblocks in a cluster
-  using EpilogueSchedule = typename SMTypeAdapter<XSM_>::EpilogueSchedule;
+#ifdef FLASHINFER_SM103_FP8_NO_SMEM_EPILOGUE
+  // CUTLASS 4.6's direct-store 2-SM epilogue is not numerically valid for the
+  // aggregate-M=128 family in this FP8 layout. Keep those CTA_M=64 kernels on
+  // the TMA epilogue while using direct store for CTA_M=128 and all 1-SM cases.
+  using EpilogueSchedule = typename cutlass::platform::conditional<
+      cutlass::platform::is_same<XSM_, _2SM>::value && CTA_M_ == 64,
+      typename SMTypeAdapter<XSM_>::TmaEpilogueSchedule,
+      typename SMTypeAdapter<XSM_>::NoSmemEpilogueSchedule>::type;
+#else
+  using EpilogueSchedule = typename SMTypeAdapter<XSM_>::TmaEpilogueSchedule;
+#endif
   using MainloopSchedule = typename SMTypeAdapter<XSM_>::MainloopSchedule;
   using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 

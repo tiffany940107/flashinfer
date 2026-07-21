@@ -319,6 +319,7 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
             (128, 64, 128),
             (128, 128, 128),
             (128, 256, 128),
+            (128, 192, 128),
         ]
         for cta_m, cta_n, cta_k in cta_m_n_k_list:
             for dtype in dtype_list:
@@ -338,7 +339,9 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10, 11]
     )
-
+    experimental_flags = []
+    if os.environ.get("FLASHINFER_SM103_FP8_NO_SMEM_EPILOGUE") == "1":
+        experimental_flags.append("-DFLASHINFER_SM103_FP8_NO_SMEM_EPILOGUE=1")
     return gen_jit_spec(
         "fp8_gemm_cutlass",
         source_paths,
@@ -346,7 +349,8 @@ def gen_gemm_sm100_module_cutlass_fp8() -> JitSpec:
         + [
             "-DENABLE_BF16",
             "-DCUTLASS_ENABLE_GDC_FOR_SM100=1",
-        ],
+        ]
+        + experimental_flags,
         extra_cflags=[
             "-DFAST_BUILD",
         ],

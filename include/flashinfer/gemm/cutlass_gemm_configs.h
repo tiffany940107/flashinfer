@@ -138,6 +138,10 @@ enum class CutlassTileConfigSM100 {
   CtaShape128x128x768B,
   CtaShape128x192x768B,
   CtaShape128x256x768B,
+
+  // SM103 FP8 experiment: matches the 128x192 per-CTA family selected by cuBLASLt.
+  // Appended so all existing serialized IDs stay stable.
+  CtaShape128x192x128B,
 };
 
 enum class CutlassTileConfigSM120 {

@@ -138,6 +138,11 @@ size_t dispatchToArch(__nv_fp8_e4m3 const* A, __nv_fp8_e4m3 const* B, float cons
           B, A, scale_a, scale_b, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr,
           workspaceBytes, stream);
       break;
+    case CutlassTileConfigSM100::CtaShape128x192x128B:
+      return dispatchGemmClusterShapeSm100<T, arch, 128, 192, 128>(
+          B, A, scale_a, scale_b, static_cast<T*>(D), n, m, k, b, gemmConfig, workspacePtr,
+          workspaceBytes, stream);
+      break;
 
     default:
       throw std::runtime_error("unsupported tile config for fp8 gemm");
@@ -210,6 +215,7 @@ std::vector<CutlassGemmConfig> CutlassFp8GemmRunner<T>::getConfigs() const {
       CutlassTileConfigSM100::CtaShape64x64x128B,   CutlassTileConfigSM100::CtaShape64x128x128B,
       CutlassTileConfigSM100::CtaShape64x256x128B,  CutlassTileConfigSM100::CtaShape128x64x128B,
       CutlassTileConfigSM100::CtaShape128x128x128B, CutlassTileConfigSM100::CtaShape128x256x128B,
+      CutlassTileConfigSM100::CtaShape128x192x128B,
   };
 
   std::vector<ClusterShape> clusterShapes = {
