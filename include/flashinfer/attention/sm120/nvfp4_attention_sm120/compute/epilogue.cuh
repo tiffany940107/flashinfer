@@ -154,6 +154,34 @@ struct CollectiveEpilogueFwd {
     cutlass::arch::fence_view_async_shared();
   }
 
+  // D=256 cannot afford a full 128x256 BF16 output tile in shared memory.
+  // Each consumer thread owns a disjoint accumulator fragment, so it can
+  // convert and store those values directly to the output tensor.
+  template <typename FrgTensorO, typename TiledMma>
+  CUTLASS_DEVICE void store_direct(Params const& epilogue_params, TiledMma tiled_mma,
+                                   FrgTensorO const& tOrO, int thread_idx, int wg_id,
+                                   int m_block, int bidh, int bidb) {
+    static_assert(Ktraits::DirectOutputStore);
+    Tensor mO =
+        make_tensor(make_gmem_ptr(epilogue_params.ptr_O), epilogue_params.shape_O,
+                    epilogue_params.stride_O);
+    Tensor cO = cute::make_identity_tensor(
+        Shape<Int<Ktraits::kBlockMPerWG>, Int<kHeadDim>>{});
+    auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
+    Tensor taccOcO = thread_mma.partition_C(cO);
+    cutlass::NumericConverter<Element, float> convert_op;
+
+#pragma unroll
+    for (int i = 0; i < size(tOrO); ++i) {
+      auto coord = taccOcO(i);
+      int row = m_block * kBlockM + wg_id * Ktraits::kBlockMPerWG + get<0>(coord);
+      int col = get<1>(coord);
+      if (row < get<0>(epilogue_params.shape_O)) {
+        mO(row, col, bidh, bidb) = convert_op(tOrO(i));
+      }
+    }
+  }
+
   template <typename SharedStorage, typename Params, typename WorkTileInfo,
             typename SchedulerParams>
   CUTLASS_DEVICE void tma_store(SharedStorage& shared_storage, Params const& epilogue_params,

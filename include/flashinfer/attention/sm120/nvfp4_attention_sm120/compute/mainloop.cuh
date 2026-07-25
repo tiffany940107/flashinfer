@@ -158,6 +158,7 @@ struct CollectiveMainloopFwd {
     ShapeQKV const shape_ds;
     StrideQKV const stride_ds;
     float const softmax_scale_log2;
+    int const q_k_head_ratio;
   };
 
   struct Params {
@@ -177,6 +178,7 @@ struct CollectiveMainloopFwd {
     TMA_SFVt tma_load_SFVt;
     TMA_DS tma_load_DS;
     float const softmax_scale_log2;
+    int const q_k_head_ratio;
   };
 
   static Params to_underlying_arguments(Arguments const& args) {
@@ -215,7 +217,8 @@ struct CollectiveMainloopFwd {
     return {args.shape_Q, layout_sfq,    args.shape_K, args.unpadded_shape_K,
             layout_sfk,   args.shape_Vt, layout_sfvt,  layout_ds,
             tma_load_Q,   tma_load_sfq,  tma_load_K,   tma_load_sfk,
-            tma_load_Vt,  tma_load_sfvt, tma_load_ds,  args.softmax_scale_log2};
+            tma_load_Vt,  tma_load_sfvt, tma_load_ds,  args.softmax_scale_log2,
+            args.q_k_head_ratio};
   }
 
   CUTLASS_DEVICE
@@ -363,6 +366,7 @@ struct CollectiveMainloopFwd {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
 
     auto [m_block, bidh, bidb] = work_tile_info.get_block_coord(scheduler_params);
+    int const bidh_k = bidh / mainloop_params.q_k_head_ratio;
 
     int n_block_max = get_n_block_max(mainloop_params, m_block);
 
@@ -388,14 +392,17 @@ struct CollectiveMainloopFwd {
     Tensor gQ =
         local_tile(mQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
     Tensor gK =
-        local_tile(mK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
-    Tensor gVt = local_tile(mVt(_, _, bidh, bidb),
+        local_tile(mK(_, _, bidh_k, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+    Tensor gVt = local_tile(mVt(_, _, bidh_k, bidb),
                             make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
                             make_coord(_0{}, _));
     Tensor gDS = [&] {
       if constexpr (BlockMean) {
+        static_assert(128 % kBlockM == 0,
+                      "QK correction groups must contain an integer number of M tiles");
+        constexpr int kMTilesPerCorrectionGroup = 128 / kBlockM;
         return local_tile(mDS(_, _, bidh, bidb), select<0, 1>(TileShape_MNK{}),
-                          make_coord(m_block, _));
+                          make_coord(m_block / kMTilesPerCorrectionGroup, _));
       } else {
         return local_tile(mDS(_, _, bidh, bidb), select<0, 1>(TileShape_MNK{}),
                           make_coord(_0{}, _));
@@ -404,8 +411,8 @@ struct CollectiveMainloopFwd {
     Tensor gSFQ = local_tile(mSFQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}),
                              make_coord(m_block, _0{}));
     Tensor gSFK =
-        local_tile(mSFK(_, _, bidh, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
-    Tensor gSFVt = local_tile(mSFVt(_, _, bidh, bidb),
+        local_tile(mSFK(_, _, bidh_k, bidb), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));
+    Tensor gSFVt = local_tile(mSFVt(_, _, bidh_k, bidb),
                               make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
                               make_coord(_0{}, _));
     auto block_tma_q = mainloop_params.tma_load_Q.get_slice(_0{});

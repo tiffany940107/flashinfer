@@ -189,17 +189,19 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp,
     }
 
     else if (producer_warp_role == ProducerWarpRole::Epilogue) {
-      for (auto work_tile_info = scheduler.get_initial_work();
-           work_tile_info.is_valid(scheduler_params);
-           work_tile_info = scheduler.get_next_work(scheduler_params, work_tile_info)) {
-        barrier_o.wait();
+      if constexpr (!Ktraits::DirectOutputStore) {
+        for (auto work_tile_info = scheduler.get_initial_work();
+             work_tile_info.is_valid(scheduler_params);
+             work_tile_info = scheduler.get_next_work(scheduler_params, work_tile_info)) {
+          barrier_o.wait();
 
-        collective_epilogue.tma_store(shared_storage, epilogue_params, work_tile_info,
-                                      scheduler_params, threadIdx.x);
+          collective_epilogue.tma_store(shared_storage, epilogue_params, work_tile_info,
+                                        scheduler_params, threadIdx.x);
 
-        collective_epilogue.store_tail();
+          collective_epilogue.store_tail();
 
-        barrier_o.arrive();
+          barrier_o.arrive();
+        }
       }
     }
   }
@@ -242,16 +244,22 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp,
                               smem_pipe_read_k, smem_pipe_read_v, tOrO, softmax_fused, n_block_max,
                               mma_thread_idx, work_idx, m_block, wg_id, shared_storage, math_order);
 
-      barrier_o.wait();
-
-      collective_epilogue.mma_store(shared_storage, tiled_mma_pv, tOrO, mma_thread_idx, wg_id);
+      if constexpr (Ktraits::DirectOutputStore) {
+        collective_epilogue.store_direct(epilogue_params, tiled_mma_pv, tOrO, mma_thread_idx,
+                                         wg_id, m_block, bidh, bidb);
+      } else {
+        barrier_o.wait();
+        collective_epilogue.mma_store(shared_storage, tiled_mma_pv, tOrO, mma_thread_idx, wg_id);
+      }
 
       LSEWriter<Ktraits>::write_lse(
           epilogue_params.ptr_LSE, select<0, 2, 3>(epilogue_params.shape_O),
           epilogue_params.stride_LSE, softmax_fused, mainloop_params.softmax_scale_log2,
           tiled_mma_pv, mma_thread_idx, m_block * kBlockM + wg_id * kBlockMPerWG, bidh, bidb);
 
-      barrier_o.arrive();
+      if constexpr (!Ktraits::DirectOutputStore) {
+        barrier_o.arrive();
+      }
 
       ++work_idx;
     }

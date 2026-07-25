@@ -70,10 +70,11 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
        {params.d, params.seqlen_k, params.h_k, params.b},
 
        static_cast<ElementDS const*>(params.delta_s_ptr),
-       {params.seqlen_s, params.seqlen_k, params.h_k, params.b},
+       {params.seqlen_s, params.seqlen_k, params.h, params.b},
        {params.ds_row_stride, _1{}, params.ds_head_stride, params.ds_batch_stride},
 
-       params.scale_softmax_log2});
+       params.scale_softmax_log2,
+       params.h_h_k_ratio});
 
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
@@ -136,8 +137,18 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
         run_flash_fwd<
             Flash_fwd_kernel_traits<Headdim, 128, kBlockN, kStages, 1, per_block, T, O, DeltaSType>,
             Is_causal>(params, stream);
+      } else if constexpr (Headdim == 256) {
+        // D=256 does not fit the SM120 per-CTA shared-memory limit with
+        // three K/V pipeline stages. Keep BlockM=128, which is required by
+        // the two consumer warp groups, and reduce the pipeline to one stage.
+        static constexpr int kStages = 1;
+        static constexpr int kBlockN = 128;
+        run_flash_fwd<
+            Flash_fwd_kernel_traits<Headdim, 128, kBlockN, kStages, 1, per_block, T, O, DeltaSType>,
+            Is_causal>(params, stream);
       } else {
-        static_assert(Headdim == 64 || Headdim == 128, "Unsupported Headdim");
+        static_assert(Headdim == 64 || Headdim == 128 || Headdim == 256,
+                      "Unsupported Headdim");
       }
     });
   });

@@ -21,7 +21,8 @@ nvfp4_attention_sm120_quantize_qkv_trace = TraceTemplate(
     description="Preprocess and quantize dense Q/K/V tensors for the SM120 NVFP4 attention kernel.",
     axes={
         "batch_size": Var(),
-        "num_heads": Var(),
+        "num_q_heads": Var(),
+        "num_kv_heads": Var(),
         "seq_len": Var(),
         "head_dim": Const(),
         "packed_head_dim": Var(),
@@ -31,20 +32,32 @@ nvfp4_attention_sm120_quantize_qkv_trace = TraceTemplate(
         "correction_seq_len": Var(),
     },
     inputs={
-        "q": Tensor(["batch_size", "num_heads", "seq_len", "head_dim"]),
-        "k": Tensor(["batch_size", "num_heads", "seq_len", "head_dim"]),
-        "v": Tensor(["batch_size", "num_heads", "seq_len", "head_dim"]),
+        "q": Tensor(["batch_size", "num_q_heads", "seq_len", "head_dim"]),
+        "k": Tensor(["batch_size", "num_kv_heads", "seq_len", "head_dim"]),
+        "v": Tensor(["batch_size", "num_kv_heads", "seq_len", "head_dim"]),
         "per_block_mean": Scalar("bool"),
     },
     outputs={
-        "q_fp4": Tensor(["batch_size", "num_heads", "seq_len", "packed_head_dim"]),
-        "k_fp4": Tensor(["batch_size", "num_heads", "seq_len", "packed_head_dim"]),
-        "v_fp4_t": Tensor(["batch_size", "num_heads", "head_dim", "packed_seq_len"]),
-        "q_scale": Tensor(["batch_size", "num_heads", "seq_len", "scale_head_dim"]),
-        "k_scale": Tensor(["batch_size", "num_heads", "seq_len", "scale_head_dim"]),
-        "v_scale_t": Tensor(["batch_size", "num_heads", "head_dim", "scale_seq_len"]),
+        "q_fp4": Tensor(
+            ["batch_size", "num_q_heads", "seq_len", "packed_head_dim"]
+        ),
+        "k_fp4": Tensor(
+            ["batch_size", "num_kv_heads", "seq_len", "packed_head_dim"]
+        ),
+        "v_fp4_t": Tensor(
+            ["batch_size", "num_kv_heads", "head_dim", "packed_seq_len"]
+        ),
+        "q_scale": Tensor(
+            ["batch_size", "num_q_heads", "seq_len", "scale_head_dim"]
+        ),
+        "k_scale": Tensor(
+            ["batch_size", "num_kv_heads", "seq_len", "scale_head_dim"]
+        ),
+        "v_scale_t": Tensor(
+            ["batch_size", "num_kv_heads", "head_dim", "scale_seq_len"]
+        ),
         "qk_correction": Tensor(
-            ["batch_size", "num_heads", "correction_seq_len", "seq_len"]
+            ["batch_size", "num_q_heads", "correction_seq_len", "seq_len"]
         ),
     },
     constraints=[
@@ -61,7 +74,8 @@ nvfp4_attention_sm120_fwd_trace = TraceTemplate(
     description="Run the SM120 NVFP4 attention forward kernel on pre-quantized Q/K/V tensors.",
     axes={
         "batch_size": Var(),
-        "num_heads": Var(),
+        "num_q_heads": Var(),
+        "num_kv_heads": Var(),
         "seq_len": Var(),
         "head_dim": Const(),
         "packed_head_dim": Const(),
@@ -71,22 +85,34 @@ nvfp4_attention_sm120_fwd_trace = TraceTemplate(
         "correction_seq_len": Var(),
     },
     inputs={
-        "q_fp4": Tensor(["batch_size", "num_heads", "seq_len", "packed_head_dim"]),
-        "k_fp4": Tensor(["batch_size", "num_heads", "seq_len", "packed_head_dim"]),
-        "v_fp4_t": Tensor(["batch_size", "num_heads", "head_dim", "packed_seq_len"]),
-        "q_scale": Tensor(["batch_size", "num_heads", "seq_len", "scale_head_dim"]),
-        "k_scale": Tensor(["batch_size", "num_heads", "seq_len", "scale_head_dim"]),
-        "v_scale_t": Tensor(["batch_size", "num_heads", "head_dim", "scale_seq_len"]),
+        "q_fp4": Tensor(
+            ["batch_size", "num_q_heads", "seq_len", "packed_head_dim"]
+        ),
+        "k_fp4": Tensor(
+            ["batch_size", "num_kv_heads", "seq_len", "packed_head_dim"]
+        ),
+        "v_fp4_t": Tensor(
+            ["batch_size", "num_kv_heads", "head_dim", "packed_seq_len"]
+        ),
+        "q_scale": Tensor(
+            ["batch_size", "num_q_heads", "seq_len", "scale_head_dim"]
+        ),
+        "k_scale": Tensor(
+            ["batch_size", "num_kv_heads", "seq_len", "scale_head_dim"]
+        ),
+        "v_scale_t": Tensor(
+            ["batch_size", "num_kv_heads", "head_dim", "scale_seq_len"]
+        ),
         "qk_correction": Tensor(
-            ["batch_size", "num_heads", "correction_seq_len", "seq_len"]
+            ["batch_size", "num_q_heads", "correction_seq_len", "seq_len"]
         ),
         "sm_scale": Scalar("float32"),
         "causal": Scalar("bool"),
         "per_block_mean": Scalar("bool"),
     },
     outputs={
-        "out": Tensor(["batch_size", "num_heads", "seq_len", "head_dim"]),
-        "lse": Tensor(["batch_size", "num_heads", "seq_len"]),
+        "out": Tensor(["batch_size", "num_q_heads", "seq_len", "head_dim"]),
+        "lse": Tensor(["batch_size", "num_q_heads", "seq_len"]),
     },
     tags=["sm120", "nvfp4"],
 )

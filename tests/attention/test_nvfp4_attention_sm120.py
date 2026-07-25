@@ -157,6 +157,8 @@ def _run_nvfp4_attention_sm120_accuracy_case(
         pytest.param(1, 4, 128, 64, False, 0.95, 0.08, id="s128-d64-noncausal"),
         pytest.param(1, 4, 256, 128, False, 0.95, 0.06, id="s256-d128-noncausal"),
         pytest.param(1, 4, 256, 128, True, 0.94, 0.09, id="s256-d128-causal"),
+        pytest.param(1, 4, 256, 256, False, 0.95, 0.06, id="s256-d256-noncausal"),
+        pytest.param(1, 4, 256, 256, True, 0.94, 0.09, id="s256-d256-causal"),
         pytest.param(1, 1, 4096, 64, False, 0.95, 0.02, id="s4096-d64-noncausal"),
         pytest.param(1, 1, 4096, 128, True, 0.95, 0.04, id="s4096-d128-causal"),
         pytest.param(1, 1, 8192, 64, False, 0.95, 0.02, id="s8192-d64-noncausal"),
@@ -181,6 +183,73 @@ def test_nvfp4_attention_sm120_accuracy(
         cos_threshold,
         mean_abs_err_threshold,
     )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("per_block_mean", [False, True])
+@pytest.mark.parametrize("batch", [1, 2, 4])
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_qwen35_gqa(batch, causal, per_block_mean):
+    """Exercise Qwen3.5's full-attention shape: Hq=16, Hkv=2, D=256."""
+    _require_sm120()
+
+    torch.manual_seed(42)
+    num_q_heads, num_kv_heads, seq_len, head_dim = 16, 2, 256, 256
+    q = torch.randn(
+        (batch, num_q_heads, seq_len, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        (batch, num_kv_heads, seq_len, head_dim),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+
+    quantized = flashinfer.nvfp4_attention_sm120_quantize_qkv(
+        q, k, v, per_block_mean=per_block_mean
+    )
+    q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, qk_correction = quantized
+    correction_rows = seq_len // 128 if per_block_mean else 1
+    assert q_fp4.shape == (batch, num_q_heads, seq_len, head_dim // 2)
+    assert k_fp4.shape == (batch, num_kv_heads, seq_len, head_dim // 2)
+    assert v_fp4_t.shape == (batch, num_kv_heads, head_dim, seq_len // 2)
+    assert q_scale.shape == (batch, num_q_heads, seq_len, head_dim // 16)
+    assert k_scale.shape == (batch, num_kv_heads, seq_len, head_dim // 16)
+    assert v_scale_t.shape == (batch, num_kv_heads, head_dim, seq_len // 16)
+    assert qk_correction.shape == (
+        batch,
+        num_q_heads,
+        correction_rows,
+        seq_len,
+    )
+
+    out, lse = flashinfer.nvfp4_attention_sm120_fwd(
+        *quantized,
+        sm_scale=head_dim**-0.5,
+        causal=causal,
+        per_block_mean=per_block_mean,
+    )
+    torch.cuda.synchronize()
+
+    heads_per_kv = num_q_heads // num_kv_heads
+    ref = torch.nn.functional.scaled_dot_product_attention(
+        q.float(),
+        k.repeat_interleave(heads_per_kv, dim=1).float(),
+        v.repeat_interleave(heads_per_kv, dim=1).float(),
+        is_causal=causal,
+        scale=head_dim**-0.5,
+    )
+    mean_abs_err = (out.float() - ref).abs().mean().item()
+    cos_sim = F.cosine_similarity(
+        out.float().reshape(1, -1), ref.reshape(1, -1)
+    ).item()
+
+    assert out.shape == q.shape
+    assert lse.shape == (batch, num_q_heads, seq_len)
+    assert mean_abs_err <= (0.09 if causal else 0.06)
+    assert cos_sim >= (0.94 if causal else 0.95)
 
 
 @pytest.mark.parametrize("per_block_mean", [True, False])

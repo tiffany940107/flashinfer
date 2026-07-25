@@ -35,7 +35,7 @@ namespace nvfp4_attention {
 template <int kStages, int EpiStages, typename Element, typename ElementSF, typename OutputType,
           typename ElementDS, typename SmemLayoutQ, typename SmemLayoutK, typename SmemLayoutV,
           typename SmemLayoutDS, typename SmemLayoutO, typename SmemLayoutSFQ,
-          typename SmemLayoutSFK, typename SmemLayoutSFV>
+          typename SmemLayoutSFK, typename SmemLayoutSFV, bool DirectOutputStore>
 struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0> {
   alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
 
@@ -49,7 +49,11 @@ struct SharedStorageQKVOwithSF : cute::aligned_struct<128, _0> {
 
   alignas(1024) cute::ArrayEngine<Element, cute::cosize_v<SmemLayoutV>> smem_v;
 
-  alignas(1024) cute::ArrayEngine<OutputType, cute::cosize_v<SmemLayoutO>> smem_o;
+  // A 128x256 BF16 output tile alone occupies 64 KiB. For D=256 the
+  // consumers write their accumulator fragments directly to global memory,
+  // so keep only a placeholder instead of reserving that shared-memory tile.
+  static constexpr int kSmemOElements = DirectOutputStore ? 1 : cute::cosize_v<SmemLayoutO>;
+  alignas(1024) cute::ArrayEngine<OutputType, kSmemOElements> smem_o;
 
   struct {
     alignas(16) typename cutlass::PipelineTmaAsync<1>::SharedStorage pipeline_q;
@@ -74,6 +78,7 @@ struct Flash_fwd_kernel_traits {
   static constexpr bool BlockMean = BlockMean_;
   static constexpr int kStoreBlockM = kBlockM;
   static constexpr bool SmoothQ = true;
+  static constexpr bool DirectOutputStore = kHeadDim >= 256;
 
   static_assert(kHeadDim % 32 == 0, "Head dim must be multiple of 32");
   static_assert(kBlockM == 64 || kBlockM == 128, "BlockM must be 64 or 128");
@@ -223,7 +228,7 @@ struct Flash_fwd_kernel_traits {
   using SharedStorage =
       SharedStorageQKVOwithSF<kStages, EpiStages, Element, ElementSF, ElementOut, ElementDS,
                               SmemLayoutQ, SmemLayoutK, SmemLayoutV, SmemLayoutDS, SmemLayoutO,
-                              SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFVt>;
+                              SmemLayoutSFQ, SmemLayoutSFK, SmemLayoutSFVt, DirectOutputStore>;
 
   using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
   using PipelineState = typename cutlass::PipelineState<kStages>;

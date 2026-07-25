@@ -45,6 +45,9 @@
   } else if (head_dim == 128) {                                         \
     constexpr int HEAD_DIM = 128;                                       \
     __VA_ARGS__                                                         \
+  } else if (head_dim == 256) {                                         \
+    constexpr int HEAD_DIM = 256;                                       \
+    __VA_ARGS__                                                         \
   } else {                                                              \
     TVM_FFI_ICHECK(false) << "Unsupported head dim: " << int(head_dim); \
   }
@@ -416,15 +419,19 @@ void scaled_fp4_quant(TensorView input, TensorView output, TensorView output_sf,
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_LOCAL(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-      dim3 block(BLOCK_SIZE * HEAD_DIM / CVT_FP4_ELTS_PER_THREAD, 1, 1);
-      dim3 grid((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, num_heads);
+      // D=256 would require 2048 threads with the original 128-token
+      // launch tile. Split it into two 64-token CTAs instead.
+      constexpr int QUANT_BLOCK_SIZE = HEAD_DIM == 256 ? 64 : BLOCK_SIZE;
+      dim3 block(QUANT_BLOCK_SIZE * HEAD_DIM / CVT_FP4_ELTS_PER_THREAD, 1, 1);
+      dim3 grid((num_tokens + QUANT_BLOCK_SIZE - 1) / QUANT_BLOCK_SIZE, batch_size, num_heads);
 
-      scaled_fp4_quant_kernel<HEAD_DIM, BLOCK_SIZE, false, c_type><<<grid, block, 0, stream>>>(
-          reinterpret_cast<c_type*>(input.data_ptr()),
-          reinterpret_cast<uint8_t*>(output.data_ptr()),
-          reinterpret_cast<uint8_t*>(output_sf.data_ptr()), batch_size, num_heads, num_tokens,
-          stride_bz_input, stride_h_input, stride_seq_input, stride_bz_output, stride_h_output,
-          stride_seq_output, stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf);
+      scaled_fp4_quant_kernel<HEAD_DIM, QUANT_BLOCK_SIZE, false, c_type>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<c_type*>(input.data_ptr()),
+              reinterpret_cast<uint8_t*>(output.data_ptr()),
+              reinterpret_cast<uint8_t*>(output_sf.data_ptr()), batch_size, num_heads, num_tokens,
+              stride_bz_input, stride_h_input, stride_seq_input, stride_bz_output, stride_h_output,
+              stride_seq_output, stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf);
     });
   });
 }
@@ -494,16 +501,17 @@ void scaled_fp4_quant_permute(TensorView input, TensorView output, TensorView ou
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_LOCAL(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-      constexpr int BLOCK_SIZE = 128;
-      dim3 block(BLOCK_SIZE * HEAD_DIM / CVT_FP4_ELTS_PER_THREAD, 1, 1);
-      dim3 grid((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, num_heads);
+      constexpr int QUANT_BLOCK_SIZE = HEAD_DIM == 256 ? 64 : BLOCK_SIZE;
+      dim3 block(QUANT_BLOCK_SIZE * HEAD_DIM / CVT_FP4_ELTS_PER_THREAD, 1, 1);
+      dim3 grid((num_tokens + QUANT_BLOCK_SIZE - 1) / QUANT_BLOCK_SIZE, batch_size, num_heads);
 
-      scaled_fp4_quant_kernel<HEAD_DIM, BLOCK_SIZE, true, c_type><<<grid, block, 0, stream>>>(
-          reinterpret_cast<c_type*>(input.data_ptr()),
-          reinterpret_cast<uint8_t*>(output.data_ptr()),
-          reinterpret_cast<uint8_t*>(output_sf.data_ptr()), batch_size, num_heads, num_tokens,
-          stride_bz_input, stride_h_input, stride_seq_input, stride_bz_output, stride_h_output,
-          stride_seq_output, stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf);
+      scaled_fp4_quant_kernel<HEAD_DIM, QUANT_BLOCK_SIZE, true, c_type>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<c_type*>(input.data_ptr()),
+              reinterpret_cast<uint8_t*>(output.data_ptr()),
+              reinterpret_cast<uint8_t*>(output_sf.data_ptr()), batch_size, num_heads, num_tokens,
+              stride_bz_input, stride_h_input, stride_seq_input, stride_bz_output, stride_h_output,
+              stride_seq_output, stride_bz_output_sf, stride_h_output_sf, stride_seq_output_sf);
     });
   });
 }
@@ -573,15 +581,19 @@ void scaled_fp4_quant_trans(TensorView input, TensorView output, TensorView outp
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16_LOCAL(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
-      dim3 block(BLOCK_SIZE * HEAD_DIM / CVT_FP4_ELTS_PER_THREAD, 1, 1);
-      dim3 grid((num_tokens + BLOCK_SIZE - 1) / BLOCK_SIZE, batch_size, num_heads);
+      // Besides keeping the launch within 1024 threads, the smaller tile
+      // reduces static transpose scratch from 64 KiB to 32 KiB for D=256.
+      constexpr int QUANT_BLOCK_SIZE = HEAD_DIM == 256 ? 64 : BLOCK_SIZE;
+      dim3 block(QUANT_BLOCK_SIZE * HEAD_DIM / CVT_FP4_ELTS_PER_THREAD, 1, 1);
+      dim3 grid((num_tokens + QUANT_BLOCK_SIZE - 1) / QUANT_BLOCK_SIZE, batch_size, num_heads);
 
-      scaled_fp4_quant_trans_kernel<HEAD_DIM, BLOCK_SIZE, c_type><<<grid, block, 0, stream>>>(
-          reinterpret_cast<c_type*>(input.data_ptr()),
-          reinterpret_cast<uint8_t*>(output.data_ptr()),
-          reinterpret_cast<uint8_t*>(output_sf.data_ptr()), batch_size, num_heads, num_tokens,
-          stride_bz_input, stride_h_input, stride_seq_input, stride_bz_output, stride_h_output,
-          stride_d_output, stride_bz_output_sf, stride_h_output_sf, stride_d_output_sf);
+      scaled_fp4_quant_trans_kernel<HEAD_DIM, QUANT_BLOCK_SIZE, c_type>
+          <<<grid, block, 0, stream>>>(
+              reinterpret_cast<c_type*>(input.data_ptr()),
+              reinterpret_cast<uint8_t*>(output.data_ptr()),
+              reinterpret_cast<uint8_t*>(output_sf.data_ptr()), batch_size, num_heads, num_tokens,
+              stride_bz_input, stride_h_input, stride_seq_input, stride_bz_output, stride_h_output,
+              stride_d_output, stride_bz_output_sf, stride_h_output_sf, stride_d_output_sf);
     });
   });
 }

@@ -38,6 +38,8 @@ def has_flashinfer_jit_cache() -> bool:
     Returns:
         True if flashinfer_jit_cache exists, False otherwise
     """
+    if os.getenv("FLASHINFER_FORCE_JIT"):
+        return False
     import importlib.util
 
     return importlib.util.find_spec("flashinfer_jit_cache") is not None
@@ -50,6 +52,8 @@ def has_flashinfer_cubin() -> bool:
     Returns:
         True if flashinfer_cubin exists, False otherwise
     """
+    if os.getenv("FLASHINFER_FORCE_JIT"):
+        return False
     import importlib.util
 
     return importlib.util.find_spec("flashinfer_cubin") is not None
