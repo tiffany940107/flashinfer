@@ -14,17 +14,17 @@
  * limitations under the License.
  */
 
-/* SM103 generic K128/K256 mainloop with an aligned Store256 epilogue. */
+/* SM10x generic K128/K256 mainloop with an aligned Store256 epilogue. */
 
 #include "flashinfer/gemm/cutlass_gemm_configs.h"
 
-#define FLASHINFER_SM103_GENERIC_STORE256_NAMESPACE 1
-#define FLASHINFER_SM103_GENERIC_NOSMEM_EPILOGUE 1
+#define FLASHINFER_SM10X_GENERIC_STORE256_NAMESPACE 1
+#define FLASHINFER_SM10X_GENERIC_NOSMEM_EPILOGUE 1
 #include "flashinfer/gemm/fp4_gemm_template_sm100.h"
 
 namespace flashinfer {
 namespace gemm {
-namespace sm103_generic_store256 {
+namespace sm10x_generic_store256 {
 INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 1, 1, _1SM)
 INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 2, 1, _1SM)
 INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 1, 4, 1, _1SM)
@@ -35,6 +35,6 @@ INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ ct
 INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 4, 4, 1, _2SM)
 INSTANTIATE_FP4_GEMM_KERNEL_LAUNCHER({{ type }}, {{ cta_m }}, {{ cta_n }}, {{ cta_k }}, 4, 1, 1, _2SM)
 
-}  // namespace sm103_generic_store256
+}  // namespace sm10x_generic_store256
 }  // namespace gemm
 }  // namespace flashinfer

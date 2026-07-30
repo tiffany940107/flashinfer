@@ -36,8 +36,8 @@
 
 namespace flashinfer {
 namespace gemm {
-#if defined(FLASHINFER_SM103_GENERIC_STORE256_NAMESPACE)
-namespace sm103_generic_store256 {
+#if defined(FLASHINFER_SM10X_GENERIC_STORE256_NAMESPACE)
+namespace sm10x_generic_store256 {
 #endif
 using namespace cute;
 
@@ -58,7 +58,7 @@ template <>
 struct SMTypeAdapter<_1SM> {
   static int const Scale = 1;
   using AtomThrShape = cute::Shape<_1, _1, _1>;
-#if defined(FLASHINFER_SM103_GENERIC_NOSMEM_EPILOGUE)
+#if defined(FLASHINFER_SM10X_GENERIC_NOSMEM_EPILOGUE)
   using EpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized1Sm;
 #else
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized1Sm;
@@ -70,7 +70,7 @@ template <>
 struct SMTypeAdapter<_2SM> {
   static int const Scale = 2;
   using AtomThrShape = cute::Shape<_2, _1, _1>;
-#if defined(FLASHINFER_SM103_GENERIC_NOSMEM_EPILOGUE)
+#if defined(FLASHINFER_SM10X_GENERIC_NOSMEM_EPILOGUE)
   using EpilogueSchedule = cutlass::epilogue::NoSmemWarpSpecialized2Sm;
 #else
   using EpilogueSchedule = cutlass::epilogue::TmaWarpSpecialized2Sm;
@@ -78,7 +78,7 @@ struct SMTypeAdapter<_2SM> {
   using MainloopSchedule = cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100;
 };
 
-#if defined(FLASHINFER_SM103_GENERIC_NOSMEM_EPILOGUE)
+#if defined(FLASHINFER_SM10X_GENERIC_NOSMEM_EPILOGUE)
 inline constexpr int kGenericFp4OutputAlignmentBits = 256;
 #else
 inline constexpr int kGenericFp4OutputAlignmentBits = 128;
@@ -307,8 +307,8 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
 
 #endif
 
-#if defined(FLASHINFER_SM103_GENERIC_STORE256_NAMESPACE)
-}  // namespace sm103_generic_store256
+#if defined(FLASHINFER_SM10X_GENERIC_STORE256_NAMESPACE)
+}  // namespace sm10x_generic_store256
 #endif
 }  // namespace gemm
 }  // namespace flashinfer

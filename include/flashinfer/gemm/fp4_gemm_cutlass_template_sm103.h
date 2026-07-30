@@ -45,7 +45,7 @@ namespace flashinfer {
 namespace gemm {
 using namespace cute;
 
-namespace sm103_generic_store256 {
+namespace sm10x_generic_store256 {
 struct _1SM;
 struct _2SM;
 
@@ -56,19 +56,19 @@ size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void 
                                     int k, int batch_count, CutlassGemmConfig gemmConfig,
                                     char* workspace, size_t const workspaceBytes,
                                     cudaStream_t stream, int* occupancy);
-}  // namespace sm103_generic_store256
+}  // namespace sm10x_generic_store256
 
 template <typename XSM_>
 struct Sm103Store256TypeAdapter;
 
 template <>
 struct Sm103Store256TypeAdapter<_1SM> {
-  using Type = sm103_generic_store256::_1SM;
+  using Type = sm10x_generic_store256::_1SM;
 };
 
 template <>
 struct Sm103Store256TypeAdapter<_2SM> {
-  using Type = sm103_generic_store256::_2SM;
+  using Type = sm10x_generic_store256::_2SM;
 };
 
 template <typename T>
@@ -93,7 +93,7 @@ size_t dispatchGenericFp4GemmKernelLauncher(void* D, void const* A, void const* 
         workspaceBytes, stream, occupancy);
   };
   auto run_store256 = [&]() {
-    return sm103_generic_store256::genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, CGA_M_,
+    return sm10x_generic_store256::genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, CGA_M_,
                                                                 CGA_N_, CGA_K_, StoreXSM>(
         D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
         workspaceBytes, stream, occupancy);

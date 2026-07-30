@@ -17,6 +17,9 @@
 #ifndef FLASHINFER_FP4_GEMM_CUTLASS_TEMPLATE_H_
 #define FLASHINFER_FP4_GEMM_CUTLASS_TEMPLATE_H_
 
+#include <algorithm>
+#include <cstdint>
+
 #ifndef _WIN32
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
@@ -41,6 +44,92 @@ namespace flashinfer {
 namespace gemm {
 using namespace cute;
 
+namespace sm10x_generic_store256 {
+struct _1SM;
+struct _2SM;
+
+template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_,
+          typename CGA_N_, typename CGA_K_, typename XSM_>
+size_t genericFp4GemmKernelLauncher(void* D, void const* A, void const* B, void const* input_sf,
+                                    void const* weight_sf, float const* global_sf, int m, int n,
+                                    int k, int batch_count, CutlassGemmConfig gemmConfig,
+                                    char* workspace, size_t const workspaceBytes,
+                                    cudaStream_t stream, int* occupancy);
+}  // namespace sm10x_generic_store256
+
+template <typename XSM_>
+struct Sm10xStore256TypeAdapter;
+
+template <>
+struct Sm10xStore256TypeAdapter<_1SM> {
+  using Type = sm10x_generic_store256::_1SM;
+};
+
+template <>
+struct Sm10xStore256TypeAdapter<_2SM> {
+  using Type = sm10x_generic_store256::_2SM;
+};
+
+// The SM100 and SM110 CUTLASS backends share this host dispatcher. Keep SM110
+// on its existing TMA epilogue until Store256 has been validated there.
+inline bool isSm100Device() {
+  static thread_local int cached_device = -1;
+  static thread_local bool cached_is_sm100 = false;
+
+  int device = -1;
+  if (cudaGetDevice(&device) != cudaSuccess) {
+    return false;
+  }
+  if (device != cached_device) {
+    int major = 0;
+    int minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+      return false;
+    }
+    cached_device = device;
+    cached_is_sm100 = major == 10 && minor == 0;
+  }
+  return cached_is_sm100;
+}
+
+template <typename T>
+bool isStore256OutputAligned(T const* output, int n) {
+  constexpr uintptr_t kStoreAlignmentBytes = 32;
+  return output != nullptr && reinterpret_cast<uintptr_t>(output) % kStoreAlignmentBytes == 0 &&
+         static_cast<uintptr_t>(n) * sizeof(T) % kStoreAlignmentBytes == 0;
+}
+
+template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_, typename CGA_M_,
+          typename CGA_N_, typename CGA_K_, typename XSM_>
+size_t dispatchGenericFp4GemmKernelLauncher(void* D, void const* A, void const* B,
+                                            void const* input_sf, void const* weight_sf,
+                                            float const* global_sf, int m, int n, int k,
+                                            int batch_count, CutlassGemmConfig gemmConfig,
+                                            char* workspace, size_t const workspaceBytes,
+                                            cudaStream_t stream, int* occupancy) {
+  using StoreXSM = typename Sm10xStore256TypeAdapter<XSM_>::Type;
+  auto run_tma = [&]() {
+    return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, CGA_M_, CGA_N_, CGA_K_, XSM_>(
+        D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
+        workspaceBytes, stream, occupancy);
+  };
+  auto run_store256 = [&]() {
+    return sm10x_generic_store256::genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, CGA_M_,
+                                                                CGA_N_, CGA_K_, StoreXSM>(
+        D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
+        workspaceBytes, stream, occupancy);
+  };
+
+  if (!A && !B && !D) {
+    return std::max(run_tma(), run_store256());
+  }
+  if (!isSm100Device()) {
+    return run_tma();
+  }
+  return isStore256OutputAligned(static_cast<T*>(D), n) ? run_store256() : run_tma();
+}
+
 template <typename T, typename CTA_M_, typename CTA_N_, typename CTA_K_>
 size_t dispatchNVFP4xNVFP4GemmClusterShapeSm100(T* D, void const* A, void const* B,
                                                 void const* input_sf, void const* weight_sf,
@@ -50,50 +139,50 @@ size_t dispatchNVFP4xNVFP4GemmClusterShapeSm100(T* D, void const* A, void const*
                                                 cudaStream_t stream, int* occupancy = nullptr) {
   switch (gemmConfig.cluster_shape) {
     case ClusterShape::ClusterShape_1x1x1:
-      return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<1>,
-                                          cute::Int<1>, _1SM>(
+      return dispatchGenericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
+                                                  cute::Int<1>, cute::Int<1>, _1SM>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_2x1x1:
-      return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<1>,
-                                          cute::Int<1>, _2SM>(
+      return dispatchGenericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>,
+                                                  cute::Int<1>, cute::Int<1>, _2SM>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_1x2x1:
-      return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<2>,
-                                          cute::Int<1>, _1SM>(
+      return dispatchGenericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
+                                                  cute::Int<2>, cute::Int<1>, _1SM>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_2x2x1:
-      return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<2>,
-                                          cute::Int<1>, _2SM>(
+      return dispatchGenericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>,
+                                                  cute::Int<2>, cute::Int<1>, _2SM>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_1x4x1:
-      return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>, cute::Int<4>,
-                                          cute::Int<1>, _1SM>(
+      return dispatchGenericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<1>,
+                                                  cute::Int<4>, cute::Int<1>, _1SM>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_4x2x1:
-      return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>, cute::Int<2>,
-                                          cute::Int<1>, _2SM>(
+      return dispatchGenericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>,
+                                                  cute::Int<2>, cute::Int<1>, _2SM>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_2x4x1:
-      return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>, cute::Int<4>,
-                                          cute::Int<1>, _2SM>(
+      return dispatchGenericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<2>,
+                                                  cute::Int<4>, cute::Int<1>, _2SM>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;
     case ClusterShape::ClusterShape_4x4x1:
-      return genericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>, cute::Int<4>,
-                                          cute::Int<1>, _2SM>(
+      return dispatchGenericFp4GemmKernelLauncher<T, CTA_M_, CTA_N_, CTA_K_, cute::Int<4>,
+                                                  cute::Int<4>, cute::Int<1>, _2SM>(
           D, A, B, input_sf, weight_sf, global_sf, m, n, k, batch_count, gemmConfig, workspace,
           workspaceBytes, stream, occupancy);
       break;

@@ -99,6 +99,7 @@ void fp4_bmm_impl(TensorView mat1, TensorView mat2, TensorView mat1Scale, Tensor
                   int64_t tactic) {
   CHECK_INPUT_AND_TYPE(mat1, FLOAT4_E2M1X2);
   CHECK_INPUT_AND_TYPE(mat2, FLOAT4_E2M1X2);
+  ffi::CUDADeviceGuard device_guard(mat1.device().device_id);
 
   int mat2_k_scale = 1;
 
