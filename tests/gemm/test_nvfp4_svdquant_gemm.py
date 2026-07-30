@@ -23,6 +23,7 @@ from flashinfer import (
     nvfp4_quantize_smooth,
     svdquant_linear,
 )
+from flashinfer.autotuner import AutoTuner
 from flashinfer.gemm.gemm_svdquant import (
     DEFAULT_WORKSPACE_SIZE,
     SVDQUANT_LORA_RANK_GRANULARITY,
@@ -112,6 +113,27 @@ def _make_gemm_problem(m, n, k, rank=_RANK, device="cuda"):
     }
 
 
+def _make_output_with_alignment(m, n, offset_bytes):
+    """Return guarded contiguous BF16 output storage with the requested 32-byte offset."""
+    assert offset_bytes in (0, 16)
+    guard_elements = 16
+    storage = torch.full(
+        (m * n + 2 * guard_elements,),
+        -1234.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    element_size = storage.element_size()
+    offset = ((offset_bytes - storage.data_ptr() % 32) % 32) // element_size
+    if offset < guard_elements:
+        offset += 32 // element_size
+    out = storage[offset : offset + m * n].view(m, n)
+    assert out.is_contiguous()
+    assert out.data_ptr() % 32 == offset_bytes
+    assert out.stride(0) * out.element_size() % 32 == 0
+    return storage, out, offset
+
+
 # n=3072 / n=12288 exercise the dedicated fast-path kernels; n=4096 the legacy
 # (generic-width) kernel. m values cover token tails and non-multiple-of-128 rows
 # (SF row padding).
@@ -194,6 +216,69 @@ def test_mm_nvfp4_svdquant_per_tactic(m, k, rank):
                 f"tactic={tactic} use_bias={use_bias} m={m} n={n} k={k} rank={rank}: "
                 f"SQNR={sqnr:.2f} dB <= 40 dB"
             )
+
+
+@pytest.mark.parametrize("use_bias", [False, True])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("rank", [32, 96])
+def test_mm_nvfp4_svdquant_public_alignment_dispatch(use_bias, enable_pdl, rank):
+    """Public API dispatches aligned SM100 output to Store256 and 16B-offset output to TMA."""
+    _skip_unless_sm100()
+    device = torch.device("cuda")
+    if get_compute_capability(device) != (10, 0):
+        pytest.skip("Store256 SVDQuant epilogue is enabled only on SM100")
+    if enable_pdl and not device_support_pdl(device):
+        pytest.skip("PDL is not supported on this device")
+
+    torch.manual_seed(100256)
+    m, n, k = 129, 512, 512
+    p = _make_gemm_problem(m, n, k, rank=rank)
+    aligned_storage, aligned, aligned_offset = _make_output_with_alignment(m, n, 0)
+    fallback_storage, fallback, fallback_offset = _make_output_with_alignment(m, n, 16)
+    bias = p["bias"] if use_bias else None
+
+    # Alignment is intentionally absent from the tuning key. Profile the aligned path,
+    # then reuse its selected tactic with a 16-byte-offset contiguous output.
+    AutoTuner.get().clear_cache()
+    with autotune(True, tuning_buckets=(m,)):
+        aligned_result = mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=bias,
+            out=aligned,
+            enable_pdl=enable_pdl,
+        )
+        fallback_result = mm_nvfp4_svdquant(
+            p["xq"],
+            p["wq"],
+            p["x_sf_flat"],
+            p["w_sf_flat"],
+            p["alpha"],
+            p["d"],
+            p["l1_scaled"],
+            bias=bias,
+            out=fallback,
+            enable_pdl=enable_pdl,
+        )
+
+    assert aligned_result.data_ptr() == aligned.data_ptr()
+    assert fallback_result.data_ptr() == fallback.data_ptr()
+    assert torch.equal(aligned_result, fallback_result)
+    ref = p["ref_bias"] if use_bias else p["ref"]
+    assert _sqnr_db(ref, aligned_result.float()) > 40.0
+
+    sentinel = torch.tensor(-1234.0, dtype=torch.bfloat16, device=device)
+    for storage, out, offset in (
+        (aligned_storage, aligned, aligned_offset),
+        (fallback_storage, fallback, fallback_offset),
+    ):
+        assert torch.all(storage[:offset] == sentinel)
+        assert torch.all(storage[offset + out.numel() :] == sentinel)
 
 
 # Chunked-rank coverage on representative kernel shapes: tactics 0/1 use K128 tiles
@@ -357,8 +442,9 @@ def test_svdquant_linear_matches_reference(use_bias, rank):
     assert _sqnr_db(ref, out.float()) > 40.0
 
 
+@pytest.mark.parametrize("offset_bytes", [0, 16])
 @pytest.mark.parametrize("rank", [32, 128])
-def test_mm_nvfp4_svdquant_cuda_graph(rank):
+def test_mm_nvfp4_svdquant_cuda_graph(rank, offset_bytes):
     _skip_unless_sm100()
     torch.manual_seed(0)
     m, n, k = 129, 3072, 3072
@@ -379,7 +465,9 @@ def test_mm_nvfp4_svdquant_cuda_graph(rank):
     module = get_nvfp4_svdquant_module()
     enable_pdl = device_support_pdl(device)
     workspace = torch.empty(DEFAULT_WORKSPACE_SIZE, dtype=torch.uint8, device=device)
-    out_graph = torch.empty(m, n, dtype=torch.bfloat16, device=device)
+    graph_storage, out_graph, graph_offset = _make_output_with_alignment(
+        m, n, offset_bytes
+    )
 
     def run(out_tensor):
         # Fixed tactic 0 keeps eager and captured launches identical.
@@ -424,12 +512,21 @@ def test_mm_nvfp4_svdquant_cuda_graph(rank):
     graph.replay()
     torch.cuda.synchronize()
 
-    out_eager = torch.empty_like(out_graph)
+    eager_storage, out_eager, eager_offset = _make_output_with_alignment(
+        m, n, offset_bytes
+    )
     run(out_eager)
     torch.cuda.synchronize()
 
     # Same tactic and operands: the deterministic kernel must match bit-exactly.
     assert torch.equal(out_graph, out_eager)
+    sentinel = torch.tensor(-1234.0, dtype=torch.bfloat16, device=device)
+    for storage, out, offset in (
+        (graph_storage, out_graph, graph_offset),
+        (eager_storage, out_eager, eager_offset),
+    ):
+        assert torch.all(storage[:offset] == sentinel)
+        assert torch.all(storage[offset + out.numel() :] == sentinel)
 
 
 if __name__ == "__main__":
