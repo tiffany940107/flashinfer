@@ -22,6 +22,35 @@ The kernel-only branch does not contain the FlashInfer Python binding or build
 system. Run the test in an environment containing the corresponding integrated
 FlashInfer implementation.
 
+## Performance Compared with SageAttention 2
+
+The following same-machine A/B result compares this QK-MXFP8/PV-NVFP4 path
+with the original [SageAttention 2](https://github.com/thu-ml/SageAttention)
+QK-INT8/PV-FP8 CUDA implementation using its `fp32+fp32` accumulation mode.
+
+Benchmark configuration:
+
+- GPU: NVIDIA RTX PRO 6000 Blackwell (SM120)
+- Shape: `B4 H8 S4096 D128`
+- Mode: noncausal, BF16, output only
+- Inputs and timing method: identical inputs and CUDA-event timing
+
+| Timing scope | SageAttention 2 QK-INT8/PV-FP8 | This kernel QK-MXFP8/PV-NVFP4 | Speedup | Latency reduction |
+|---|---:|---:|---:|---:|
+| Attention kernel only | 0.7210 ms | 0.5780 ms | 1.247x | 19.8% |
+| Complete call including quantization | 0.9397 ms | 0.7450 ms | 1.261x | 20.7% |
+
+Speedup is calculated as `SageAttention latency / this-kernel latency`.
+Inclusive timing contains each implementation's preprocessing and
+quantization work.
+
+The upstream SageAttention 2 repository does not provide a prebuilt SM120
+binary for this path. The benchmark retained the original INT8/FP8 kernel
+implementation and recompiled it for `sm_120a`; it was not an SM120-specific
+kernel rewrite. GPU clocks were not locked, so these same-run A/B measurements
+should be treated as a reproducible reference for this machine rather than a
+universal performance guarantee.
+
 ## Python API
 
 The one-call API follows the SageAttention-style interface:
