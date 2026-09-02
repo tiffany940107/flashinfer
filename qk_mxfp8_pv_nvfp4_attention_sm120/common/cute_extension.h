@@ -27,7 +27,7 @@ namespace cute::SM120::BLOCKSCALED {
 using cutlass::float_e2m1_t;
 using cutlass::float_ue4m3_t;
 
-// MMA.SF 16x32x64 TN E2M1 x E2M1 with SF E4M3
+
 struct SM120_16x32x64_TN_VS_NVFP4 {
   using DRegisters = float[16];
   using ARegisters = uint32_t[4];
@@ -58,13 +58,13 @@ struct SM120_16x32x64_TN_VS_NVFP4 {
     static constexpr uint16_t tidB2 = 2;
     static constexpr uint16_t tidB3 = 3;
 
-    // ---- each pair of independent mma.sync instructions.
-    // ---- The 4 MMAs have NO register dependency on each other (different d/c regs).
-    // ---- If total time doesn't increase, MUFU executes for free during MMA pipeline
-    // ---- latency, confirming instruction-level overlap is possible on SM120a.
+
+
+
+
 
 #if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
-    // MMA 1/4: d0,d1,d8,d9
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -80,7 +80,7 @@ struct SM120_16x32x64_TN_VS_NVFP4 {
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c8), "f"(c9),
           "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB), "h"(tidB0));
 
-    // MMA 2/4: d2,d3,d10,d11
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -97,7 +97,7 @@ struct SM120_16x32x64_TN_VS_NVFP4 {
           "f"(c11), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(tidB1));
 
-    // MMA 3/4: d4,d5,d12,d13
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -114,7 +114,7 @@ struct SM120_16x32x64_TN_VS_NVFP4 {
           "f"(c13), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(tidB2));
 
-    // MMA 4/4: d6,d7,d14,d15
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -138,19 +138,19 @@ struct SM120_16x32x64_TN_VS_NVFP4 {
   }
 };
 
-// MMA.SF 16x64x64 TN E2M1 x E2M1 with SF E4M3
-// Wider N: 8 PTX mma.sync instructions (tidB0-7) instead of 4.
-// Doubles TC work per atom call, fills pipeline better during softmax overlap.
+
+
+
 struct SM120_16x64x64_TN_VS_NVFP4 {
-  using DRegisters = float[32];     // 2× (16×64 output vs 16×32)
-  using ARegisters = uint32_t[4];   // same (M×K unchanged)
-  using BRegisters = uint32_t[16];  // 2× (64N needs 2× B data)
-  using CRegisters = float[32];     // 2× accumulator
+  using DRegisters = float[32];
+  using ARegisters = uint32_t[4];
+  using BRegisters = uint32_t[16];
+  using CRegisters = float[32];
 
   static constexpr int SFBits = 32;
   using RegTypeSF = cute::uint_bit_t<SFBits>;
   using SFARegisters = RegTypeSF[1];
-  using SFBRegisters = RegTypeSF[1];  // Same as 16x32: SFB is K-dependent, not N-dependent
+  using SFBRegisters = RegTypeSF[1];
 
   CUTE_HOST_DEVICE static void fma(
       float& d0, float& d1, float& d2, float& d3, float& d4, float& d5, float& d6, float& d7,
@@ -175,9 +175,9 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
     static constexpr uint16_t bidB = 0;
 
 #if defined(CUTE_ARCH_MXF4NVF4_4X_UE4M3_MMA_ENABLED)
-    // 8 PTX mma.sync instructions covering N=0..63 (8 × n8 = 64N)
 
-    // MMA 1/8: tidB=0, N=[0,8)
+
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -187,7 +187,7 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
           "f"(c17), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(uint16_t(0)));
 
-    // MMA 2/8: tidB=1, N=[8,16)
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -197,7 +197,7 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
           "f"(c19), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(uint16_t(1)));
 
-    // MMA 3/8: tidB=2, N=[16,24)
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -207,7 +207,7 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
           "f"(c21), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(uint16_t(2)));
 
-    // MMA 4/8: tidB=3, N=[24,32)
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -217,7 +217,7 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
           "f"(c23), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(uint16_t(3)));
 
-    // MMA 5/8: tidB=4, N=[32,40) — second SF block
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -227,7 +227,7 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
           "f"(c25), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(uint16_t(0)));
 
-    // MMA 6/8: tidB=5, N=[40,48)
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -237,7 +237,7 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
           "f"(c27), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(uint16_t(1)));
 
-    // MMA 7/8: tidB=6, N=[48,56)
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -247,7 +247,7 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
           "f"(c29), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(uint16_t(2)));
 
-    // MMA 8/8: tidB=7, N=[56,64)
+
     asm volatile(
         "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1."
         "f32.ue4m3 "
@@ -264,8 +264,8 @@ struct SM120_16x64x64_TN_VS_NVFP4 {
   }
 };
 
-// MMA.SF 16x32x32 TN E4M3 x E4M3 with SF UE8M0
-// Composite atom: 4 PTX mma.sync instructions (tidB0-3) covering N=32.
+
+
 struct SM120_16x32x32_TN_VS_FP8 {
   using DRegisters = float[16];
   using ARegisters = uint32_t[4];
@@ -296,10 +296,10 @@ struct SM120_16x32x32_TN_VS_FP8 {
     static constexpr uint16_t tidB2 = 2;
     static constexpr uint16_t tidB3 = 3;
 
-    // ---- each pair of independent mma.sync instructions.
+
 
 #if defined(CUTE_ARCH_MXF8F6F4_MMA_ENABLED)
-    // MMA 1/4: d0,d1,d8,d9
+
     asm volatile(
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3."
         "f32.ue8m0 "
@@ -315,7 +315,7 @@ struct SM120_16x32x32_TN_VS_FP8 {
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "f"(c0), "f"(c1), "f"(c8), "f"(c9),
           "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB), "h"(tidB0));
 
-    // MMA 2/4: d2,d3,d10,d11
+
     asm volatile(
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3."
         "f32.ue8m0 "
@@ -332,7 +332,7 @@ struct SM120_16x32x32_TN_VS_FP8 {
           "f"(c11), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(tidB1));
 
-    // MMA 3/4: d4,d5,d12,d13
+
     asm volatile(
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3."
         "f32.ue8m0 "
@@ -349,7 +349,7 @@ struct SM120_16x32x32_TN_VS_FP8 {
           "f"(c13), "r"(uint32_t(sfa0)), "h"(bidA), "h"(tidA), "r"(uint32_t(sfb0)), "h"(bidB),
           "h"(tidB2));
 
-    // MMA 4/4: d6,d7,d14,d15
+
     asm volatile(
         "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3."
         "f32.ue8m0 "
@@ -373,10 +373,10 @@ struct SM120_16x32x32_TN_VS_FP8 {
   }
 };
 
-// Variant of the composite FP8 atom that exposes the three issue gaps between
-// its four independent m16n8k32 instructions.  The normal CuTe atom emits the
-// same instructions back-to-back, which leaves no source-level place to
-// schedule scalar softmax work on the otherwise independent score slot.
+
+
+
+
 template <typename GapFn>
 CUTE_HOST_DEVICE static void fma_fp8_with_interleave(
     float& d0, float& d1, float& d2, float& d3, float& d4, float& d5, float& d6, float& d7,
@@ -439,27 +439,27 @@ CUTE_HOST_DEVICE static void fma_fp8_with_interleave(
 #endif
 }
 
-}  // namespace cute::SM120::BLOCKSCALED
+}
 
 namespace cute {
 
-// MMA FP8 Block-Scaled 16x32x32 TN
-//
-// Composite of 4 PTX mxf8f6f4 m16n8k32 instructions covering N=32.
-// A/B/C layouts derived from SM80_16x8x32_S32S8S8S32_TN (the base for all
-// SM120 16x8x32 variants), expanded to N=32.
-// SFA/SFB layouts from CUTLASS mma_traits_sm120.hpp:194-198.
-//
-// Base SM80_16x8x32 block-scaled layouts (from mma_traits_sm80.hpp):
-//   ALayout: (T32, V16) -> (M16, K32)
-//     Shape<Shape<_4,_8>, Shape<_4,_2,_2>>, Stride<Stride<_64,_1>, Stride<_16,_8,_256>>
-//   BLayout: (T32, V8) -> (N8, K32)
-//     Shape<Shape<_4,_8>, Shape<_4,_2>>, Stride<Stride<_32,_1>, Stride<_8,_128>>
-//   CLayout: SM80_16x8_Row (T32, V4) -> (M16, N8)
-//
-// Composite N=32 expansion (4 tidB groups, same as NVFP4 pattern):
-//   BLayout: add _4 in value dim, strides scaled for 4 tidB groups
-//   CLayout: same as NVFP4 composite (M16×N32, same output tile)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 template <>
 struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x32x32_TN_VS_FP8> {
   using ValTypeA = uint8_t;
@@ -473,38 +473,38 @@ struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x32x32_TN_VS_FP8> {
   using Shape_MNK = Shape<_16, _32, _32>;
   using ThrID = Layout<_32>;
 
-  // ALayout: (T32, V16) -> (M16, K32)
-  // Same as base SM80_16x8x32 (A shared across all 4 tidB instructions)
+
+
   using ALayout = Layout<Shape<Shape<_4, _8>, Shape<_4, _2, _2>>,
                          Stride<Stride<_64, _1>, Stride<_16, _8, _256>>>;
 
-  // BLayout: (T32, V32) -> (N32, K32)
-  // Base: (T32, V8) Shape<Shape<_4,_8>, Shape<_4,_2>> Stride<Stride<_32,_1>, Stride<_8,_128>>
-  // Composite 4-wide N: all base strides ×4 (N: 8→32), new tidB mode stride _8.
-  // Col-major B tensor (K=32, N=32): flat = k*32 + n.  tidB shifts n by 8 → stride _8.
-  // Matches NVFP4 pattern: v0 stride = base_v0×4, v1 stride = base_v1×4, v2(tidB) = _8.
+
+
+
+
+
   using BLayout = Layout<Shape<Shape<_4, _8>, Shape<_4, _2, _4>>,
                          Stride<Stride<_128, _1>, Stride<_32, _512, _8>>>;
 
-  // SFALayout: (T32, V32) -> (M16, K32) — from CUTLASS base block-scaled
+
   using SFALayout = Layout<Shape<Shape<_2, _2, _8>, _32>, Stride<Stride<_8, _0, _1>, _16>>;
 
-  // SFBLayout: N-expanded for smem copy compatibility (same pattern as NVFP4 composite).
-  // All 4 tidB groups share one sfb0 register in fma(), but the layout must be
-  // non-zero strided for smem copy to work.  mma_unpack extracts element 0.
+
+
+
   using SFBLayout = Layout<Shape<Shape<_4, _8>, _32>, Stride<Stride<_8, _1>, _32>>;
 
-  // CLayout: (T32, V16) -> (M16, N32)
-  // Same as NVFP4 composite (16 float outputs, 4 per tidB × 4 tidB groups)
+
+
   using CLayout = Layout<Shape<Shape<_4, _8>, Shape<Shape<_2, _4>, _2>>,
                          Stride<Stride<_32, _1>, Stride<Stride<_16, _128>, _8>>>;
 };
 
-// CuTe's generic SM120 block-scaled unpacker assumes a single N8 MMA atom.
-// The FP8 atom above is a source-level composite of four N8 instructions, so
-// its expanded B/C layouts intentionally contain more values than the base
-// atom assertions allow. Keep the specialization local to this operation and
-// extract the one UE8M0 scale register consumed by all four instructions.
+
+
+
+
+
 namespace SM120::BLOCKSCALED {
 
 template <class TD, class DLayout, class TA, class ALayout, class TB, class BLayout, class TC,
@@ -548,12 +548,12 @@ CUTE_HOST_DEVICE constexpr void mma_unpack(MMA_Traits<SM120_16x32x32_TN_VS_FP8> 
                   make_int_sequence<RegNumSFA>{}, rSFB, make_int_sequence<RegNumSFB>{});
 }
 
-}  // namespace SM120::BLOCKSCALED
+}
 
-// MMA NVFP4 16x32x64 TN
+
 template <>
 struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4> {
-  // The MMA accepts 4-bit inputs regardless of the types for A and B
+
   using ValTypeA = uint4_t;
   using ValTypeB = uint4_t;
 
@@ -566,23 +566,23 @@ struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x32x64_TN_VS_NVFP4> {
   using Shape_MNK = Shape<_16, _32, _64>;
   using ThrID = Layout<_32>;
 
-  // (T32,V32) -> (M16,K64)
+
   using ALayout = Layout<Shape<Shape<_4, _8>, Shape<_8, _2, _2>>,
                          Stride<Stride<_128, _1>, Stride<_16, _8, _512>>>;
-  // (T32,V64) -> (N32,K64)
+
   using BLayout = Layout<Shape<Shape<_4, _8>, Shape<_8, _2, _4>>,
                          Stride<Stride<_256, _1>, Stride<_32, _1024, _8>>>;
-  // (T32,V64) -> (M16,K64)
+
   using SFALayout = Layout<Shape<Shape<_2, _2, _8>, _64>, Stride<Stride<_8, _0, _1>, _16>>;
-  // (T32,V64) -> (N32,K64)
+
   using SFBLayout = Layout<Shape<Shape<_4, _8>, _64>, Stride<Stride<_8, _1>, _32>>;
-  // (T32,V16) -> (M16,N32)
+
   using CLayout = Layout<Shape<Shape<_4, _8>, Shape<Shape<_2, _4>, _2>>,
                          Stride<Stride<_32, _1>, Stride<Stride<_16, _128>, _8>>>;
 };
 
-// MMA NVFP4 16x64x64 TN (wider N variant, 8 PTX instructions)
-// Derived from 16x32x64 by doubling N: _4→_8 in value shapes, strides unchanged.
+
+
 template <>
 struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x64x64_TN_VS_NVFP4> {
   using ValTypeA = uint4_t;
@@ -595,24 +595,24 @@ struct MMA_Traits<SM120::BLOCKSCALED::SM120_16x64x64_TN_VS_NVFP4> {
   using Shape_MNK = Shape<_16, _64, _64>;
   using ThrID = Layout<_32>;
 
-  // A layout: same as 16x32x64 (M×K unchanged)
-  // (T32,V32) -> (M16,K64)
+
+
   using ALayout = Layout<Shape<Shape<_4, _8>, Shape<_8, _2, _2>>,
                          Stride<Stride<_128, _1>, Stride<_16, _8, _512>>>;
-  // B layout: 8 tidB groups (was 4) → (T32,V128) -> (N64,K64)
-  // Pattern: base BLayout × 8 N-copies. Stride _8 per tidB in N dimension.
+
+
   using BLayout = Layout<Shape<Shape<_4, _8>, Shape<_8, _2, _8>>,
                          Stride<Stride<_512, _1>, Stride<_64, _2048, _8>>>;
-  // SFA layout: same as 16x32x64 (M×K only, no N dependency)
-  // (T32,V64) -> (M16,K64)
+
+
   using SFALayout = Layout<Shape<Shape<_2, _2, _8>, _64>, Stride<Stride<_8, _0, _1>, _16>>;
-  // SFB layout: V64 (= K dimension, NOT N). N covered by thread stride.
-  // (T32,V64) -> (N64,K64). Thread stride _0,_1 means 4:0 mode (8 active threads).
-  // Same value dimension as 16x32 (SFB logical size = K = 64).
+
+
+
   using SFBLayout = Layout<Shape<Shape<_4, _8>, _64>, Stride<Stride<_0, _1>, _8>>;
-  // C layout: 8 tidB groups (was 4) → (T32,V32) -> (M16,N64)
-  // _4→_8 in value inner shape. Thread stride unchanged (_32).
-  // N-major linearization: index = n*16 + m. Stride _128 = 8N_per_tidB × 16M.
+
+
+
   using CLayout = Layout<Shape<Shape<_4, _8>, Shape<Shape<_2, _8>, _2>>,
                          Stride<Stride<_32, _1>, Stride<Stride<_16, _128>, _8>>>;
 };
@@ -628,23 +628,23 @@ CUTE_HOST_DEVICE constexpr auto thrfrg_SFA(SFATensor&& sfatensor,
   auto permutation_mnk = TiledPerm{};
   auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
 
-  // Reorder the tensor for the TiledAtom
-  auto t_tile = make_tile(get<0>(permutation_mnk), get<2>(permutation_mnk));
-  auto t_tensor = logical_divide(sfatensor, t_tile);  // (PermM,PermK)
 
-  // Tile the tensor for the Atom
+  auto t_tile = make_tile(get<0>(permutation_mnk), get<2>(permutation_mnk));
+  auto t_tensor = logical_divide(sfatensor, t_tile);
+
+
   auto a_tile =
       make_tile(make_layout(size<0>(AtomShape_MNK{})), make_layout(size<2>(AtomShape_MNK{})));
-  auto a_tensor = zipped_divide(t_tensor, a_tile);  // ((AtomM,AtomK),(RestM,RestK))
+  auto a_tensor = zipped_divide(t_tensor, a_tile);
 
-  // Transform the Atom mode from (M,K) to (Thr,Val)
-  auto tv_tensor = a_tensor.compose(AtomLayoutSFA_TV{}, _);  // ((ThrV,FrgV),(RestM,RestK))
 
-  // Tile the tensor for the Thread
+  auto tv_tensor = a_tensor.compose(AtomLayoutSFA_TV{}, _);
+
+
   auto thr_tile = make_tile(
       _, make_tile(make_layout(size<1>(thr_layout_vmnk)), make_layout(size<3>(thr_layout_vmnk))));
   auto thr_tensor =
-      zipped_divide(tv_tensor, thr_tile);  // ((ThrV,(ThrM,ThrK)),(FrgV,(RestM,RestK)))
+      zipped_divide(tv_tensor, thr_tile);
 
   return thr_tensor;
 }
@@ -660,23 +660,23 @@ CUTE_HOST_DEVICE constexpr auto thrfrg_SFB(SFBTensor&& sfbtensor,
   auto permutation_mnk = TiledPerm{};
   auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
 
-  // Reorder the tensor for the TiledAtom
-  auto t_tile = make_tile(get<1>(permutation_mnk), get<2>(permutation_mnk));
-  auto t_tensor = logical_divide(sfbtensor, t_tile);  // (PermN,PermK)
 
-  // Tile the tensor for the Atom
+  auto t_tile = make_tile(get<1>(permutation_mnk), get<2>(permutation_mnk));
+  auto t_tensor = logical_divide(sfbtensor, t_tile);
+
+
   auto a_tile =
       make_tile(make_layout(size<1>(AtomShape_MNK{})), make_layout(size<2>(AtomShape_MNK{})));
-  auto a_tensor = zipped_divide(t_tensor, a_tile);  // ((AtomN,AtomK),(RestN,RestK))
+  auto a_tensor = zipped_divide(t_tensor, a_tile);
 
-  // Transform the Atom mode from (M,K) to (Thr,Val)
-  auto tv_tensor = a_tensor.compose(AtomLayoutSFB_TV{}, _);  // ((ThrV,FrgV),(RestN,RestK))
 
-  // Tile the tensor for the Thread
+  auto tv_tensor = a_tensor.compose(AtomLayoutSFB_TV{}, _);
+
+
   auto thr_tile = make_tile(
       _, make_tile(make_layout(size<2>(thr_layout_vmnk)), make_layout(size<3>(thr_layout_vmnk))));
   auto thr_tensor =
-      zipped_divide(tv_tensor, thr_tile);  // ((ThrV,(ThrN,ThrK)),(FrgV,(RestN,RestK)))
+      zipped_divide(tv_tensor, thr_tile);
   return thr_tensor;
 }
 
@@ -712,40 +712,40 @@ CUTE_HOST_DEVICE constexpr auto partition_fragment_SFB(SFBTensor&& sfbtensor, Th
 
 template <class TiledMma>
 CUTE_HOST_DEVICE constexpr auto get_layoutSFA_TV(TiledMma& mma) {
-  // (M,K) -> (M,K)
+
   auto tile_shape_mnk = tile_shape(mma);
   auto ref_A = make_layout(make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
   auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
 
-  // (ThrV,(ThrM,ThrK)) -> (ThrV,(ThrM,ThrN,ThrK))
+
   auto atile = make_tile(
       _, make_tile(make_layout(make_shape(size<1>(thr_layout_vmnk), size<2>(thr_layout_vmnk)),
                                make_stride(Int<1>{}, Int<0>{})),
                    _));
 
-  // thr_idx -> (ThrV,ThrM,ThrN,ThrK)
+
   auto thridx_2_thrid = right_inverse(thr_layout_vmnk);
-  // (thr_idx,val) -> (M,K)
+
   return thrfrg_SFA(ref_A, mma).compose(atile, _).compose(thridx_2_thrid, _);
 }
 
 template <class TiledMma>
 CUTE_HOST_DEVICE constexpr auto get_layoutSFB_TV(TiledMma& mma) {
-  // (N,K) -> (N,K)
+
   auto tile_shape_mnk = tile_shape(mma);
   auto ref_B = make_layout(make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
   auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
 
-  // (ThrV,(ThrM,ThrK)) -> (ThrV,(ThrM,ThrN,ThrK))
+
   auto btile = make_tile(
       _, make_tile(make_layout(make_shape(size<1>(thr_layout_vmnk), size<2>(thr_layout_vmnk)),
                                make_stride(Int<0>{}, Int<1>{})),
                    _));
 
-  // thr_idx -> (ThrV,ThrM,ThrN,ThrK)
+
   auto thridx_2_thrid = right_inverse(thr_layout_vmnk);
-  // (thr_idx,val) -> (M,K)
+
   return thrfrg_SFB(ref_B, mma).compose(btile, _).compose(thridx_2_thrid, _);
 }
 
-}  // namespace cute
+}

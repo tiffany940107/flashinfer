@@ -16,8 +16,8 @@ namespace qk_mxfp8_pv_nvfp4_attention {
 
 using namespace cute;
 
-// Unpack the custom N32 FP8 atom exactly as CuTe's mma_unpack does, while
-// retaining callback points between the four independent N8 PTX operations.
+
+
 template <class MMAOp, class GapFn, class TD, class DLayout, class TA, class ALayout, class TB,
           class BLayout, class TC, class CLayout>
 CUTE_HOST_DEVICE void mma_unpack_fp8_interleaved(MMA_Traits<MMAOp> const&, Tensor<TD, DLayout>& D,
@@ -57,4 +57,4 @@ CUTE_HOST_DEVICE void gemm_fp8_interleaved(TiledMma const&, Tensor<TC, CLayout>&
   mma_unpack_fp8_interleaved(MMA_Traits<MMAOp>{}, C, A, B, C, static_cast<GapFn&&>(gap_fn));
 }
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}

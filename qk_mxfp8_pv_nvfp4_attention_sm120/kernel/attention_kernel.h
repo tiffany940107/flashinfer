@@ -42,11 +42,11 @@ inline constexpr int kProducerRegisters = 24;
 inline constexpr int kPersistentConsumerRegisters = 232;
 inline constexpr int kSingleTileConsumerRegisters = 240;
 
-/**
- *
- *
- *
- */
+
+
+
+
+
 template <typename Ktraits, bool Is_causal, bool ReturnLSE, typename TileScheduler>
 __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 1)
     attention_kernel_ws(
@@ -61,10 +61,10 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
   using TileShape_MNK = typename Ktraits::TileShape_MNK;
   using ClusterShape = typename Ktraits::ClusterShape_MNK;
 
-  static constexpr int NumMmaThreads = size(typename Ktraits::TiledMmaQK{});  // 128 (per WG)
-  static constexpr int NumCopyThreads = cutlass::NumThreadsPerWarpGroup;      // 128 (producer WG)
+  static constexpr int NumMmaThreads = size(typename Ktraits::TiledMmaQK{});
+  static constexpr int NumCopyThreads = cutlass::NumThreadsPerWarpGroup;
   static constexpr int kBlockM = Ktraits::kBlockM;
-  static constexpr int kBlockMPerWG = Ktraits::kBlockMPerWG;  // 64
+  static constexpr int kBlockMPerWG = Ktraits::kBlockMPerWG;
 
   using CollectiveMainloop = CollectiveMainloopFwd<Ktraits, Is_causal>;
   using CollectiveEpilogue = CollectiveEpilogueFwd<Ktraits>;
@@ -96,8 +96,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
     CollectiveEpilogue::prefetch_tma_descriptors(epilogue_params);
   }
 
-  // Every active consumer warp-group participates in wait/release for each
-  // stage.  The M64 specialization uses one group; M128 uses two.
+
+
   static constexpr int NumAllConsumerThreads = Ktraits::kNumConsumerWarGroups * NumMmaThreads;
 
   PipelineParams pipeline_params_v;
@@ -140,8 +140,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
 
   __syncthreads();
 
-  // ============================================
-  // ============================================
+
+
   if (warp_group_role == WarpGroupRole::Producer) {
     cutlass::arch::warpgroup_reg_dealloc<kProducerRegisters>();
 
@@ -185,13 +185,13 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
     }
   }
 
-  // ============================================
-  // ============================================
+
+
   else if (warp_group_idx >= 1 && warp_group_idx <= Ktraits::kNumConsumerWarGroups) {
-    // N64 score-slot reuse has a slightly higher peak live range in the
-    // single-tile kernel.  Eight additional registers avoid spilling the
-    // softmax/QK-refill overlap, while persistent kernels keep the smaller
-    // allocation that performs better for medium sequence lengths.
+
+
+
+
     static constexpr int ConsumerRegisters =
         std::is_same_v<TileScheduler, qk_mxfp8_pv_nvfp4_attention::SingleTileScheduler>
             ? kSingleTileConsumerRegisters
@@ -203,11 +203,11 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
 
     int consumer_thread_idx = threadIdx.x - NumCopyThreads;
     int wg_id = warp_group_idx - 1;
-    int mma_thread_idx = consumer_thread_idx % NumMmaThreads;  // 0-127 for both WGs
+    int mma_thread_idx = consumer_thread_idx % NumMmaThreads;
 
     PipelineState smem_pipe_read_k, smem_pipe_read_v;
     PipelineStateQ smem_pipe_read_q;
-    // Scheme A: both WGs start at stage 0, advance by 1 (normal)
+
 
     int work_idx = 0;
 
@@ -226,8 +226,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
          work_tile_info.is_valid(scheduler_params);
          work_tile_info = scheduler.get_next_work(scheduler_params, work_tile_info)) {
       if (defer_q_release && q_release_deferred) {
-        // Q and O share smem. Wait until the previous O TMA store is done
-        // before releasing Q, otherwise the producer can overwrite O/Q early.
+
+
         barrier_o.wait();
         pipeline_q.consumer_release(smem_pipe_read_q);
         ++smem_pipe_read_q;
@@ -259,8 +259,8 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
         q_release_deferred = true;
       }
 
-      // === Store the output ===
-      // Wait until the producer has finished the preceding TMA store.
+
+
       if (!defer_q_release) {
         barrier_o.wait();
       }
@@ -287,4 +287,4 @@ __global__ void __launch_bounds__(Ktraits::kNWarps* cutlass::NumThreadsPerWarp, 
   }
 }
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}

@@ -28,4 +28,4 @@ using flashinfer::math::mul;
 using flashinfer::math::ptx_exp2;
 using flashinfer::math::SumOp;
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}

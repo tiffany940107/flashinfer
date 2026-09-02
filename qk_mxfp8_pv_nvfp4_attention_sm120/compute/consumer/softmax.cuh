@@ -17,12 +17,12 @@ namespace qk_mxfp8_pv_nvfp4_attention {
 
 using namespace cute;
 
-/**
- * Fused Online Softmax with Quantization
- *
- *
- *
- */
+
+
+
+
+
+
 template <int Rows>
 struct SoftmaxFused {
   using TensorT = decltype(make_fragment_like<float>(Shape<Int<Rows>>{}));
@@ -32,13 +32,13 @@ struct SoftmaxFused {
 
   static constexpr float fp8_scalexfp4_scale = 1.f / (448 * 6);
   static constexpr float fp8_scalexfp4_scale_log2 =
-      -11.392317422778762f;  // log2(fp8_scalexfp4_scale)
+      -11.392317422778762f;
   static constexpr float fp4_scale_log2 = -2.584962500721156f;
   static constexpr float n64_fp8_scalexfp4_scale_log2 = fp8_scalexfp4_scale_log2;
   static constexpr int RowReductionThr = 4;
 
-  /**
-   */
+
+
   CUTLASS_DEVICE SoftmaxFused() {};
 
   CUTLASS_DEVICE static float reduce_row_max_from_pairs(float value) {
@@ -49,8 +49,8 @@ struct SoftmaxFused {
     return value;
   }
 
-  // Find the row maximum for the complete N128 score tile before either
-  // N64 half is converted to P and reused for the following QK tile.
+
+
   template <bool FirstTile, bool InfCheck = false, typename TensorAcc, typename TensorMax>
   CUTLASS_DEVICE void prepare_online_softmax_n128(TensorAcc& acc, TensorMax& AbsMaxP,
                                                   const float softmax_scale_log2) {
@@ -94,8 +94,8 @@ struct SoftmaxFused {
     }
   }
 
-  // Convert one N64 score half to normalized FP32 values ready for the
-  // existing packed-FP4 quantizer. The other N64 half remains untouched.
+
+
   template <int ScoreSlot, bool InfCheck = false, int FirstRow = 0, int RowCount = Rows,
             typename TensorAcc, typename TensorMax, typename TensorP>
   CUTLASS_DEVICE void softmax_quantize_n64(TensorAcc& acc, TensorMax& AbsMaxP,
@@ -117,14 +117,14 @@ struct SoftmaxFused {
                    : row_max(mi) * softmax_scale_log2 + n64_fp8_scalexfp4_scale_log2;
 
       auto exp2_sum = [&](auto ni) {
-        // Compute P directly in the FP4-normalized domain. For a
-        // chunk maximum c and online row maximum m:
-        //   P_norm = exp2((s-c)*scale) * 6
-        //   P_sf   = exp2((c-m)*scale) * 448
-        // Their product is the same 2688-scaled probability used by
-        // the original path. Accumulate the normalized chunk first,
-        // then apply P_sf once instead of normalizing every element
-        // with a reciprocal and a multiply in a second pass.
+
+
+
+
+
+
+
+
         float const chunk_max = AbsMaxP(mi, ni);
         bool const empty_chunk = chunk_max == -INFINITY;
         float const chunk_max_safe = empty_chunk ? 0.0f : chunk_max;
@@ -154,12 +154,12 @@ struct SoftmaxFused {
     }
   }
 
-  /**
-   *
-   *
-   *
-   *
-   */
+
+
+
+
+
+
   template <bool FirstTile, bool InfCheck = false, typename TensorAcc, typename TensorMax>
   CUTLASS_DEVICE auto online_softmax_with_quant(TensorAcc& acc, TensorMax& AbsMaxP,
                                                 const float softmax_scale_log2) {
@@ -268,8 +268,8 @@ struct SoftmaxFused {
       }
     }
 
-    // Quantize in-place with a scalar reciprocal to avoid keeping a second
-    // AbsMaxP-shaped register tensor live across the conversion loop.
+
+
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < size(AbsMaxP); ++i) {
       float inv_absmax = AbsMaxP(i) == 0.0f ? 0.0f : 1.0f / AbsMaxP(i);
@@ -341,10 +341,10 @@ struct SoftmaxFused {
     }
   }
 
-  /**
-   *
-   *
-   */
+
+
+
+
   template <typename TensorAcc>
   CUTLASS_DEVICE void finalize(TensorAcc& o_store) {
     Tensor o_store_reduction_view =
@@ -368,11 +368,11 @@ struct SoftmaxFused {
     }
   }
 
-  /**
-   *
-   * O_new = O_old * scale + O_current
-   *
-   */
+
+
+
+
+
   template <typename TensorAcc>
   CUTLASS_DEVICE void rescale_o(TensorAcc& o_store, TensorAcc const& o_tmp) {
     Tensor o_store_reduction_view = make_tensor(
@@ -390,9 +390,9 @@ struct SoftmaxFused {
     }
   }
 
-  // The N64 slot-reuse path accumulates PV directly into o_store. Once the
-  // next tile establishes a new online-softmax maximum, only the existing
-  // accumulator needs to be rescaled before that tile's PV contributions.
+
+
+
   template <typename TensorAcc>
   CUTLASS_DEVICE void rescale_o_inplace(TensorAcc& o_store) {
     Tensor o_store_reduction_view = make_tensor(
@@ -410,8 +410,8 @@ struct SoftmaxFused {
  private:
   __device__ __forceinline__ static float pscale_exp2(float x) { return ptx_exp2(x); }
 
-  /**
-   */
+
+
   __device__ __forceinline__ static float ptx_exp2(float x) {
     float result;
     asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(x));
@@ -419,4 +419,4 @@ struct SoftmaxFused {
   }
 };
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}

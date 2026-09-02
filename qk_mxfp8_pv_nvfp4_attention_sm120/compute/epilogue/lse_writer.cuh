@@ -37,10 +37,10 @@ struct LSEWriter {
   using ShapeLSE = cute::Shape<int32_t, int32_t, int32_t>;
   using StrideLSE = cute::Stride<_1, int64_t, int64_t>;
 
-  // Writes the LSE rows owned by one consumer thread. tiled_mma must be the
-  // per-warp-group PV mma whose accumulator softmax_fused reduced over, and
-  // row_offset the first sequence position of this warp group's sub-tile
-  // (m_block * kBlockM + wg_id * kBlockMPerWG).
+
+
+
+
   template <typename SoftmaxFused, typename TiledMma, typename Shape, typename Stride>
   __device__ __forceinline__ static void write_lse(float* ptr_LSE, Shape const& shape_LSE,
                                                    Stride const& stride_LSE,
@@ -58,7 +58,7 @@ struct LSEWriter {
     auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
     Tensor taccOcO = thread_mma.partition_C(caccO);
 
-    // acc fragment atom is (AtomN, AtomM) = (8, 2) for the 16x32 mma
+
     static_assert(decltype(size<0, 0>(taccOcO))::value % 8 == 0);
     static_assert(decltype(size<0, 1>(taccOcO))::value == 2);
 
@@ -77,9 +77,9 @@ struct LSEWriter {
           float max_scaled = row_max(mi) * softmax_scale_log2 / log2_e;
           float sum = row_sum(mi);
 
-          // row_sum carries the 2^-fp8_scalexfp4_scale_log2 factor the
-          // softmax bakes into every exp for the FP4 P quantization;
-          // remove it so lse is the plain ln-sum-exp of the scaled scores.
+
+
+
           float lse =
               (sum == 0.f || sum != sum)
                   ? INFINITY
@@ -92,4 +92,4 @@ struct LSEWriter {
   }
 };
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}

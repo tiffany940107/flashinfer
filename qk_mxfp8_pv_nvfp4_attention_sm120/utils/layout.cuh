@@ -58,4 +58,4 @@ CUTLASS_DEVICE constexpr int qk_acc_col_to_k_col(int col) {
   return (col & ~31) + (k_pair << 1) + (col_in_mma & 1);
 }
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}

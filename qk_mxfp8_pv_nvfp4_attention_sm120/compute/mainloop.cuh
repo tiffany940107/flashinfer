@@ -40,8 +40,8 @@ struct CollectiveMainloopFwd {
   using ElementPV = typename Ktraits::ElementPV;
   using ElementSFPV = typename Ktraits::ElementSFPV;
   using ElementDS = typename Ktraits::ElementDS;
-  // using TMAElement = Element;
-  // using TMAElementSF = typename Ktraits::ElementSF;
+
+
   using TileShape_MNK = typename Ktraits::TileShape_MNK;
   using SFQTileShape_MNK = typename Ktraits::SFQTileShape_MNK;
   using SFKTileShape_MNK = typename Ktraits::SFKTileShape_MNK;
@@ -60,10 +60,10 @@ struct CollectiveMainloopFwd {
   using LayoutDS = decltype(blocked_product(
       SmemLayoutAtomDS{}, make_layout(make_shape(int32_t(0), int32_t(0), int32_t(0), int32_t(0)),
                                       make_stride(int32_t(0), _1{}, int32_t(0), int32_t(0)))));
-  using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
+  using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;
   using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
   using ShapeSF =
-      cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d // 16, head, batch)
+      cute::Shape<int32_t, int32_t, int32_t, int32_t>;
   using LayoutSF = typename Ktraits::LayoutSF;
   using LayoutP = typename Ktraits::LayoutP;
   using LayoutSFP = typename Ktraits::LayoutSFP;
@@ -103,14 +103,14 @@ struct CollectiveMainloopFwd {
   using TMA_SFQ = decltype(make_tma_copy<uint16_t>(
       GmemTiledCopySF{}, make_tensor(static_cast<ElementSF const*>(nullptr), LayoutSF{}),
       SmemLayoutSFQ{}, make_shape(shape<0>(SFQTileShape_MNK{}), shape<2>(SFQTileShape_MNK{})),
-      _1{}));  // No programmatic multicast
+      _1{}));
 
   using TMA_SFKV = decltype(make_tma_copy<uint16_t>(
       GmemTiledCopySF{}, make_tensor(static_cast<ElementSF const*>(nullptr), LayoutSF{}),
       SmemLayoutSFK{}(_, _, cute::Int<0>{}),
       make_shape(shape<1>(SFKTileShape_MNK{}), shape<2>(SFKTileShape_MNK{})), _1{}));
 
-  // SFVt TMA: V^T scale factors (UE4M3, FP4 PV path)
+
   using LayoutSFPV = typename Ktraits::LayoutSFPV;
   using TMA_SFVt = decltype(make_tma_copy<uint16_t>(
       GmemTiledCopySF{}, make_tensor(static_cast<ElementSFPV const*>(nullptr), LayoutSFPV{}),
@@ -133,7 +133,7 @@ struct CollectiveMainloopFwd {
   using PipelineStateQ = typename Ktraits::PipelineStateQ;
   using EpilogueBarrier = typename Ktraits::EpilogueBarrier;
 
-  // Set the bytes transferred in this TMA transaction (may involve multiple issues)
+
   static constexpr uint32_t TmaTransactionBytesQ = static_cast<uint32_t>(
       cutlass::bits_to_bytes(cosize((SmemLayoutSFQ{})) * cute::sizeof_bits_v<ElementSF>) +
       cutlass::bits_to_bytes(size((SmemLayoutQ{})) * sizeof_bits<Element>::value));
@@ -149,7 +149,7 @@ struct CollectiveMainloopFwd {
                              cute::sizeof_bits_v<ElementSFPV>) +
       cutlass::bits_to_bytes(size(take<0, 2>(SmemLayoutVt{})) * sizeof_bits<ElementPV>::value));
 
-  // Host side kernel arguments
+
   struct Arguments {
     Element const* ptr_Q;
     ShapeQKV const shape_Q;
@@ -166,13 +166,13 @@ struct CollectiveMainloopFwd {
     ShapeSF const shape_SFQ{};
     ElementSF const* ptr_SFK{nullptr};
     ShapeSF const shape_SFK{};
-    ElementSFPV const* ptr_SFVt{nullptr};  // V SF: UE4M3 (PV stays FP4)
+    ElementSFPV const* ptr_SFVt{nullptr};
     ShapeSF const shape_SFVt{};
     cutlass::FastDivmod const group_size_fastdiv;
     float const softmax_scale_log2;
   };
 
-  // Device side kernel params
+
   struct Params {
     ShapeQKV const shape_Q;
     ShapeQKV const unpadded_shape_Q;
@@ -181,7 +181,7 @@ struct CollectiveMainloopFwd {
     ShapeQKV const unpadded_shape_K;
     LayoutSF const layout_SFK;
     ShapeQKV const shape_Vt;
-    LayoutSFPV const layout_SFVt;  // V SF: FP4 PV path layout
+    LayoutSFPV const layout_SFVt;
     TMA_Q tma_load_Q;
     TMA_SFQ tma_load_SFQ;
     TMA_KV tma_load_K;
@@ -195,16 +195,16 @@ struct CollectiveMainloopFwd {
   static Params to_underlying_arguments(Arguments const& args) {
     Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), args.shape_Q, args.stride_Q);
     TMA_Q tma_load_Q = make_tma_copy(GmemTiledCopy{}, mQ, SmemLayoutQ{},
-                                     select<0, 2>(TileShape_MNK{}), _1{});  // no mcast for Q
+                                     select<0, 2>(TileShape_MNK{}), _1{});
     Tensor mK = make_tensor(make_gmem_ptr(args.ptr_K), args.shape_K, args.stride_K);
     TMA_KV tma_load_K =
         make_tma_copy(GmemTiledCopy{}, mK, SmemLayoutK{}(_, _, _0{}), select<1, 2>(TileShape_MNK{}),
-                      _1{});  // mcast along M mode for this N load, if any
+                      _1{});
     Tensor mVt = make_tensor(make_gmem_ptr(args.ptr_Vt), args.shape_Vt, args.stride_Vt);
     TMA_Vt tma_load_Vt =
         make_tma_copy(GmemTiledCopy{}, mVt, SmemLayoutVt{}(_, _, _0{}),
                       make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
-                      _1{});  // mcast along M mode for this N load, if any
+                      _1{});
     LayoutSF layout_sfq = BlkScaledConfig::tile_atom_to_shape_SFQKV(args.shape_SFQ);
     Tensor mSFQ = make_tensor(make_gmem_ptr(args.ptr_SFQ), layout_sfq);
     TMA_SFQ tma_load_sfq = make_tma_copy<uint16_t>(
@@ -215,7 +215,7 @@ struct CollectiveMainloopFwd {
     TMA_SFKV tma_load_sfk = make_tma_copy<uint16_t>(
         GmemTiledCopySF{}, mSFK, SmemLayoutSFK{}(_, _, _0{}),
         make_shape(shape<1>(SFKTileShape_MNK{}), shape<2>(SFKTileShape_MNK{})), _1{});
-    // SFVt: loaded via TMA as ue4m3 (same format as K SF)
+
     using BlkScaledConfigPV = typename Ktraits::BlkScaledConfigPV;
     LayoutSFPV layout_sfvt = BlkScaledConfigPV::tile_atom_to_shape_SFVt(args.shape_SFVt);
     Tensor mSFVt = make_tensor(make_gmem_ptr(args.ptr_SFVt), layout_sfvt);
@@ -240,7 +240,7 @@ struct CollectiveMainloopFwd {
             args.softmax_scale_log2};
   }
 
-  /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
+
   CUTLASS_DEVICE
   static void prefetch_tma_descriptors(Params const& mainloop_params) {
     cute::prefetch_tma_descriptor(mainloop_params.tma_load_Q.get_tma_descriptor());
@@ -276,23 +276,23 @@ struct CollectiveMainloopFwd {
     auto permutation_mnk = TiledPerm{};
     auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
 
-    // Reorder the tensor for the TiledAtom
-    auto t_tile = make_tile(get<0>(permutation_mnk), get<2>(permutation_mnk));
-    auto t_tensor = logical_divide(sfatensor, t_tile);  // (PermM,PermK)
 
-    // Tile the tensor for the Atom
+    auto t_tile = make_tile(get<0>(permutation_mnk), get<2>(permutation_mnk));
+    auto t_tensor = logical_divide(sfatensor, t_tile);
+
+
     auto a_tile =
         make_tile(make_layout(size<0>(AtomShape_MNK{})), make_layout(size<2>(AtomShape_MNK{})));
-    auto a_tensor = zipped_divide(t_tensor, a_tile);  // ((AtomM,AtomK),(RestM,RestK))
+    auto a_tensor = zipped_divide(t_tensor, a_tile);
 
-    // Transform the Atom mode from (M,K) to (Thr,Val)
-    auto tv_tensor = a_tensor.compose(AtomLayoutSFA_TV{}, _);  // ((ThrV,FrgV),(RestM,RestK))
 
-    // Tile the tensor for the Thread
+    auto tv_tensor = a_tensor.compose(AtomLayoutSFA_TV{}, _);
+
+
     auto thr_tile = make_tile(
         _, make_tile(make_layout(size<1>(thr_layout_vmnk)), make_layout(size<3>(thr_layout_vmnk))));
     auto thr_tensor =
-        zipped_divide(tv_tensor, thr_tile);  // ((ThrV,(ThrM,ThrK)),(FrgV,(RestM,RestK)))
+        zipped_divide(tv_tensor, thr_tile);
 
     return thr_tensor;
   }
@@ -308,23 +308,23 @@ struct CollectiveMainloopFwd {
     auto permutation_mnk = TiledPerm{};
     auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
 
-    // Reorder the tensor for the TiledAtom
-    auto t_tile = make_tile(get<1>(permutation_mnk), get<2>(permutation_mnk));
-    auto t_tensor = logical_divide(sfbtensor, t_tile);  // (PermN,PermK)
 
-    // Tile the tensor for the Atom
+    auto t_tile = make_tile(get<1>(permutation_mnk), get<2>(permutation_mnk));
+    auto t_tensor = logical_divide(sfbtensor, t_tile);
+
+
     auto a_tile =
         make_tile(make_layout(size<1>(AtomShape_MNK{})), make_layout(size<2>(AtomShape_MNK{})));
-    auto a_tensor = zipped_divide(t_tensor, a_tile);  // ((AtomN,AtomK),(RestN,RestK))
+    auto a_tensor = zipped_divide(t_tensor, a_tile);
 
-    // Transform the Atom mode from (M,K) to (Thr,Val)
-    auto tv_tensor = a_tensor.compose(AtomLayoutSFB_TV{}, _);  // ((ThrV,FrgV),(RestN,RestK))
 
-    // Tile the tensor for the Thread
+    auto tv_tensor = a_tensor.compose(AtomLayoutSFB_TV{}, _);
+
+
     auto thr_tile = make_tile(
         _, make_tile(make_layout(size<2>(thr_layout_vmnk)), make_layout(size<3>(thr_layout_vmnk))));
     auto thr_tensor =
-        zipped_divide(tv_tensor, thr_tile);  // ((ThrV,(ThrN,ThrK)),(FrgV,(RestN,RestK)))
+        zipped_divide(tv_tensor, thr_tile);
     return thr_tensor;
   }
 
@@ -354,39 +354,39 @@ struct CollectiveMainloopFwd {
 
   template <class TiledMma>
   CUTE_HOST_DEVICE constexpr auto get_layoutSFA_TV(TiledMma& mma) {
-    // (M,K) -> (M,K)
+
     auto tile_shape_mnk = tile_shape(mma);
     auto ref_A = make_layout(make_shape(size<0>(tile_shape_mnk), size<2>(tile_shape_mnk)));
     auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
 
-    // (ThrV,(ThrM,ThrK)) -> (ThrV,(ThrM,ThrN,ThrK))
+
     auto atile = make_tile(
         _, make_tile(make_layout(make_shape(size<1>(thr_layout_vmnk), size<2>(thr_layout_vmnk)),
                                  make_stride(Int<1>{}, Int<0>{})),
                      _));
 
-    // thr_idx -> (ThrV,ThrM,ThrN,ThrK)
+
     auto thridx_2_thrid = right_inverse(thr_layout_vmnk);
-    // (thr_idx,val) -> (M,K)
+
     return thrfrg_SFA(ref_A, mma).compose(atile, _).compose(thridx_2_thrid, _);
   }
 
   template <class TiledMma>
   CUTE_HOST_DEVICE constexpr auto get_layoutSFB_TV(TiledMma& mma) {
-    // (N,K) -> (N,K)
+
     auto tile_shape_mnk = tile_shape(mma);
     auto ref_B = make_layout(make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
     auto thr_layout_vmnk = mma.get_thr_layout_vmnk();
 
-    // (ThrV,(ThrM,ThrK)) -> (ThrV,(ThrM,ThrN,ThrK))
+
     auto btile = make_tile(
         _, make_tile(make_layout(make_shape(size<1>(thr_layout_vmnk), size<2>(thr_layout_vmnk)),
                                  make_stride(Int<0>{}, Int<1>{})),
                      _));
 
-    // thr_idx -> (ThrV,ThrM,ThrN,ThrK)
+
     auto thridx_2_thrid = right_inverse(thr_layout_vmnk);
-    // (thr_idx,val) -> (M,K)
+
     return thrfrg_SFB(ref_B, mma).compose(btile, _).compose(thridx_2_thrid, _);
   }
 
@@ -423,12 +423,12 @@ struct CollectiveMainloopFwd {
     uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x,
                                     block_rank_in_cluster / cluster_shape_x};
     Tensor gQ = local_tile(mQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}),
-                           make_coord(m_block, _0{}));  // (M, K)
+                           make_coord(m_block, _0{}));
     Tensor gK = local_tile(mK(_, _, kv_head, bidb), select<1, 2>(TileShape_MNK{}),
-                           make_coord(_, _0{}));  // (N, K, _)
+                           make_coord(_, _0{}));
     Tensor gVt = local_tile(mVt(_, _, kv_head, bidb),
                             make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})),
-                            make_coord(_0{}, _));  // (N, K, _)
+                            make_coord(_0{}, _));
     Tensor gSFQ = local_tile(mSFQ(_, _, bidh, bidb), select<0, 2>(SFQTileShape_MNK{}),
                              make_coord(m_block / Ktraits::kSFQTilesPerScaleTile, _0{}));
     Tensor gSFK = local_tile(mSFK(_, _, kv_head, bidb), select<1, 2>(SFKTileShape_MNK{}),
@@ -442,8 +442,8 @@ struct CollectiveMainloopFwd {
     auto block_tma_sfq = mainloop_params.tma_load_SFQ.get_slice(_0{});
     Tensor tQgSFQ = block_tma_sfq.partition_S(gSFQ);
     Tensor tQsSFQ = block_tma_sfq.partition_D(sSFQ);
-    // Rank-adaptive group: flatten all prefix modes except the last one.
-    // Handles both kStages=3 (rank 4+) and kStages=2 (rank 3+) TMA partitions.
+
+
     auto gp = [](auto t) {
       constexpr int R = decltype(rank(t))::value;
       if constexpr (R <= 2) {
@@ -497,7 +497,7 @@ struct CollectiveMainloopFwd {
 
     n_block--;
     if (lane_predicate) {
-// CUTLASS_PRAGMA_NO_UNROLL
+
 #pragma unroll 2
       for (; n_block >= 0; --n_block) {
         pipeline_k.producer_acquire(smem_pipe_write_k);
@@ -522,13 +522,13 @@ struct CollectiveMainloopFwd {
     ++work_idx;
   }
 
-  /// Perform a Producer Epilogue to prevent early exit of blocks in a Cluster
+
   CUTLASS_DEVICE void load_tail(MainloopPipelineQ pipeline_q, MainloopPipeline pipeline_k,
                                 MainloopPipeline pipeline_v, PipelineStateQ& smem_pipe_write_q,
                                 PipelineState& smem_pipe_write_k,
                                 PipelineState& smem_pipe_write_v) {
     int lane_predicate = cute::elect_one_sync();
-    // Issue the epilogue waits
+
     if (lane_predicate) {
       pipeline_q.producer_tail(smem_pipe_write_q);
       pipeline_k.producer_tail(smem_pipe_write_k);
@@ -536,8 +536,8 @@ struct CollectiveMainloopFwd {
     }
   }
 
-  // Default no-op refill for warp-specialized kernels, whose producer runs
-  // independently from the consumer warp groups.
+
+
   struct NoOpRefill {
     CUTLASS_DEVICE void refill_k(int) {}
     CUTLASS_DEVICE void refill_v(int) {}
@@ -550,10 +550,10 @@ struct CollectiveMainloopFwd {
                           PipelineStateQ& smem_pipe_read_q, PipelineState& smem_pipe_read_k,
                           PipelineState& smem_pipe_read_v, FrgTensorO& tOrO_store,
                           SoftmaxFused& softmax_fused,
-                          int n_block_count,  // total N-blocks
-                          int thread_idx,     // 0-127 (per-WG MMA thread)
+                          int n_block_count,
+                          int thread_idx,
                           int work_idx, int m_block,
-                          int wg_id,  // 0 or 1
+                          int wg_id,
                           SharedStorage& shared_storage, bool defer_q_release = false,
                           TmaRefill tma_refill = {}) {
     static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
@@ -561,10 +561,10 @@ struct CollectiveMainloopFwd {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kBlockK = get<2>(TileShape_MNK{});
-    static constexpr int kBlockMPerWG = Ktraits::kBlockMPerWG;  // 64 (WS) or 128 (Non-WS)
+    static constexpr int kBlockMPerWG = Ktraits::kBlockMPerWG;
     static constexpr int kSFQTilesPerScaleTile = Ktraits::kSFQTilesPerScaleTile;
 
-    // ============ Smem tensors ============
+
     Tensor sQ_full =
         make_tensor(make_smem_ptr(shared_storage.smem_q_storage().begin()), SmemLayoutQ{});
     Tensor sK = make_tensor(make_smem_ptr(shared_storage.smem_k.begin()), SmemLayoutK{});
@@ -573,25 +573,25 @@ struct CollectiveMainloopFwd {
     Tensor sSFK = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), SmemLayoutSFK{});
     Tensor sSFVt = make_tensor(make_smem_ptr(shared_storage.smem_SFV.begin()), SmemLayoutSFVt{});
 
-    // ============ Per-WG Q slice (64 M-rows) ============
+
     auto sQ =
         local_tile(sQ_full, make_shape(Int<kBlockMPerWG>{}, Int<kBlockK>{}), make_coord(wg_id, 0));
 
-    // ============ MMA setup ============
+
     TiledMmaQK tiled_mma_qk;
     TiledMmaPV tiled_mma_pv;
     auto thread_mma_qk = tiled_mma_qk.get_thread_slice(thread_idx);
     auto thread_mma_pv = tiled_mma_pv.get_thread_slice(thread_idx);
 
-    // 8-atom MMA (256 threads) for SFQ partitioning only.
-    // consumer_thread_idx: WG1=0-127 → atoms 0-3 (rows 0-63),
-    //                      WG2=128-255 → atoms 4-7 (rows 64-127).
+
+
+
     using TiledMmaQK_Full = typename Ktraits::TiledMmaQK_Full;
     TiledMmaQK_Full tiled_mma_qk_full;
     int consumer_thread_idx_full = thread_idx + wg_id * NumMmaThreads;
     auto thread_mma_qk_full = tiled_mma_qk_full.get_thread_slice(consumer_thread_idx_full);
 
-    // Fragment A from WG's Q half (64 M-rows)
+
     Tensor tSrQ = thread_mma_qk.partition_fragment_A(sQ);
     Tensor tSrK = thread_mma_qk.partition_fragment_B(sK(_, _, Int<0>{}));
     Tensor tOrVt = thread_mma_pv.partition_fragment_B(sVt(_, _, Int<0>{}));
@@ -605,18 +605,18 @@ struct CollectiveMainloopFwd {
       }
     };
     auto sSFQ_active = select_sfq_tile(m_block);
-    // SFQ uses the full compute-M MMA layout after selecting the active
-    // 64-row half of the hardware's 128-row scale-factor tile.
+
+
     Tensor tSrSFQ = partition_fragment_SFA(sSFQ_active, thread_mma_qk_full);
     auto tSrSFK_full = partition_fragment_SFB(sSFK(_, _, Int<0>{}), thread_mma_qk);
     Tensor tSrSFK = tSrSFK_full;
-    // SFV is a PV operand scale factor, so its register fragment must match
-    // the PV MMA scale-factor layout.
+
+
     Tensor tOrSFVt = partition_fragment_SFB(sSFVt(_, _, Int<0>{}), thread_mma_pv);
     Tensor tOrSFP = make_tensor<ElementSFPV>(LayoutSFP{});
     Tensor tOrSFP_flt = filter_zeros(tOrSFP);
 
-    // ============ Smem copy setup ============
+
     auto smem_tiled_copy_Q = make_tiled_copy_A(SmemCopyAtomQ{}, tiled_mma_qk);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(thread_idx);
     Tensor tSsQ = smem_thr_copy_Q.partition_S(as_position_independent_swizzle_tensor(sQ));
@@ -635,7 +635,7 @@ struct CollectiveMainloopFwd {
     auto v_copy_register_block = [&](auto block_id) { return tOrVt_copy_view(_, _, block_id); };
 
     auto tile_shape_mnk = tile_shape(tiled_mma_qk);
-    // SFQ smem copy: use 8-atom MMA layout + consumer_thread_idx_full
+
     auto tile_shape_mnk_full = tile_shape(tiled_mma_qk_full);
     auto smem_tiled_copy_SFQ = make_tiled_copy_impl(
         SmemCopyAtomSF{}, get_layoutSFA_TV(tiled_mma_qk_full),
@@ -652,7 +652,7 @@ struct CollectiveMainloopFwd {
     Tensor tSsSFK = smem_thr_copy_SFK.partition_S(as_position_independent_swizzle_tensor(sSFK));
     Tensor tSrSFK_copy_view = smem_thr_copy_SFK.retile_D(tSrSFK);
 
-    // SFV: PV-path SF format (UE4M3), derive layout from PV MMA
+
     auto smem_tiled_copy_SFV =
         make_tiled_copy_impl(SmemCopyAtomSFPV{}, get_layoutSFB_TV(tiled_mma_pv),
                              make_shape(size<1>(tile_shape_mnk), size<2>(tile_shape_mnk)));
@@ -660,7 +660,7 @@ struct CollectiveMainloopFwd {
     Tensor tOsSFVt = smem_thr_copy_SFV.partition_S(as_position_independent_swizzle_tensor(sSFVt));
     Tensor tOrSFVt_copy_view = smem_thr_copy_SFV.retile_D(tOrSFVt);
 
-    // ============ Helpers ============
+
     auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {
       auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
       pipeline.consumer_wait(smem_pipe_read, barrier_token);
@@ -669,7 +669,7 @@ struct CollectiveMainloopFwd {
     int const seqlen_q = get<0>(mainloop_params.unpadded_shape_Q);
     int const seqlen_k = get<0>(mainloop_params.unpadded_shape_K);
     int const unpadded_seqlen_k = get<0>(mainloop_params.unpadded_shape_K);
-    int const wg_m_offset = wg_id * kBlockMPerWG;  // 0 or 64
+    int const wg_m_offset = wg_id * kBlockMPerWG;
 
     auto copy_k_block = [&](auto block_id) {
       auto tSsK_stage = tSsK(_, _, _, smem_pipe_read_k.index());
@@ -678,9 +678,9 @@ struct CollectiveMainloopFwd {
       copy(smem_tiled_copy_SFK, tSsSFK_stage(_, _, block_id), tSrSFK_copy_view(_, _, block_id));
     };
 
-    // Copy one N32 group for all FP8 QK K32 repeats. This is used after
-    // an N64 score slot has been retired, so only the K registers needed
-    // to rebuild that half of the following score tile are touched.
+
+
+
     auto copy_k_group = [&](auto group_id) {
       auto tSsK_stage = tSsK(_, _, _, smem_pipe_read_k.index());
       auto tSsSFK_stage = tSsSFK(_, _, _, smem_pipe_read_k.index());
@@ -702,7 +702,7 @@ struct CollectiveMainloopFwd {
 
     auto add_delta_s = [&](auto& acc) { cute::clear(acc); };
 
-    // S accumulator for 64 M-rows × kBlockN (declared here so lambdas can capture)
+
     Tensor tSrS =
         partition_fragment_C(tiled_mma_qk, make_shape(Int<kBlockMPerWG>{}, Int<kBlockN>{}));
     Tensor tSrS_converion_view = make_tensor(
@@ -727,12 +727,12 @@ struct CollectiveMainloopFwd {
     static_assert(decltype(size<2>(tOrP))::value == 2,
                   "Each N64 score slot must map to one PV block");
 
-    // Causal mask boundary: row is local (0-63), add wg_m_offset for global position
+
     auto col_limit_causal = [&](int row, int n_block) {
       return row + wg_m_offset + 1 + seqlen_k - n_block * kBlockN - seqlen_q + m_block * kBlockM;
     };
 
-    // Masking lambda (applies seqlen + causal mask)
+
     auto apply_mask = [&](auto& tSrS_local, int n_block_local) {
       if constexpr (!Is_causal) {
         if (int(unpadded_seqlen_k - n_block_local * kBlockN) >= int(kBlockN)) {
@@ -769,7 +769,7 @@ struct CollectiveMainloopFwd {
       }
     };
 
-    // Quantize P to NVFP4 so the second GEMM uses the NVFP4 P/V path.
+
     int const quant_quad_id = threadIdx.x & 3;
     uint32_t const quant_sfp_mask = uint32_t(0xFF00FF) << ((quant_quad_id & 1) * 8);
     bool const quant_quad_even = (quant_quad_id & 1) == 0;
@@ -814,7 +814,7 @@ struct CollectiveMainloopFwd {
       }
     };
 
-    // ============ Load Q (both WGs, each reads its 64-row half) ============
+
     consumer_wait(pipeline_q, smem_pipe_read_q);
     copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy_view);
     copy(smem_tiled_copy_SFQ, tSsSFQ, tSrSFQ_copy_view);
@@ -824,10 +824,10 @@ struct CollectiveMainloopFwd {
     }
 
     if constexpr (!Is_causal) {
-      // Symmetric N64/N64 score-slot reuse. Build the first N128 score tile,
-      // then retire each N64 half after quantization and immediately reuse
-      // those registers to construct the corresponding half of the next QK
-      // tile while packed P remains live in its dedicated PV fragment.
+
+
+
+
       auto refill_score_slot = [&](auto score_slot, int refill_tile_idx) {
         constexpr int ScoreSlot = decltype(score_slot)::value;
         constexpr int FirstMmaN = ScoreSlot * 2;
@@ -868,9 +868,9 @@ struct CollectiveMainloopFwd {
         softmax_fused.template softmax_quantize_n64<ScoreSlot, Is_causal>(
             tSrS, AbsMaxP, mainloop_params.softmax_scale_log2, tOrP);
         if constexpr (ScoreSlot == 0) {
-          // Preserve the compiler-visible convergence point while the
-          // first score half changes from softmax input to packed P and
-          // then back into a QK accumulator.
+
+
+
           __syncwarp();
         }
         quantize(score_slot, tSrS_converion_view);
@@ -950,9 +950,9 @@ struct CollectiveMainloopFwd {
           return;
         }
 
-        // Derive logical coordinates directly from the FP8 QK accumulator
-        // layout. This avoids keeping a 64x128 identity tensor live solely
-        // for the (at most one) partial K tile.
+
+
+
         CUTLASS_PRAGMA_UNROLL
         for (int i = 0; i < size(scores); ++i) {
           int const lane = thread_idx & 31;
@@ -965,7 +965,7 @@ struct CollectiveMainloopFwd {
 
       clear(tOrO_store);
 
-      // Prologue: construct a complete N128 score tile.
+
       consumer_wait(pipeline_k, smem_pipe_read_k);
       add_delta_s_slot(tSrS, _0{});
       add_delta_s_slot(tSrS, _1{});
@@ -984,13 +984,13 @@ struct CollectiveMainloopFwd {
       softmax_fused.template prepare_online_softmax_n128<true, Is_causal>(
           tSrS, AbsMaxP, mainloop_params.softmax_scale_log2);
 
-// Branch-free steady state: consume P0/P1 while rebuilding QK0/QK1.
+
 #pragma unroll 1
       for (int tile_idx = 0; tile_idx < n_block_count - 1; ++tile_idx) {
-        // Fine-grained one-shot phase probes let the two consumer warp
-        // groups enter the steady-state loop at complementary scalar/MMA
-        // positions.  Point 9 sits between slot-0 softmax and packing;
-        // the older point 1 is after both operations.
+
+
+
+
         prepare_score_slot(_0{});
 
         consumer_wait(pipeline_k, smem_pipe_read_k);
@@ -998,8 +998,8 @@ struct CollectiveMainloopFwd {
         copy_k_group(_0{});
         copy_k_group(_1{});
 
-        // The first independent QK group creates tensor-scoreboard room
-        // for the other N64 half's scalar softmax and FP4 conversion.
+
+
         gemm_score_slot_k(_0{}, _0{});
         prepare_score_slot(_1{});
         gemm_score_slot_k(_0{}, _1{});
@@ -1028,7 +1028,7 @@ struct CollectiveMainloopFwd {
         softmax_fused.rescale_o_inplace(tOrO_store);
       }
 
-      // Drain the final tile without a has-next predicate in the hot loop.
+
       process_score_slot(_0{}, cute::false_type{}, n_block_count);
       process_score_slot(_1{}, cute::false_type{}, n_block_count);
 
@@ -1042,24 +1042,24 @@ struct CollectiveMainloopFwd {
 
     bool is_first_compute = true;
 
-    // Causal tiles use the conventional online-softmax path. Both
-    // consumer warp groups traverse every K/V tile for their own M64 rows.
+
+
 
 #pragma unroll 1
     for (int tile_idx = 0; tile_idx < n_block_count; ++tile_idx) {
       int n_block = n_block_count - 1 - tile_idx;
 
-      // --- K: both WGs wait for data ready ---
+
       consumer_wait(pipeline_k, smem_pipe_read_k);
 
-      // --- QK GEMM ---
+
       Tensor tSrS_local =
           partition_fragment_C(tiled_mma_qk, make_shape(Int<kBlockMPerWG>{}, Int<kBlockN>{}));
       Tensor tSrS_local_cv = make_tensor(
           tSrS_local.data(),
           qk_mxfp8_pv_nvfp4_attention::convert_to_conversion_layout(tSrS_local.layout()));
 
-      // Default path: streaming K copy + GEMM (no early release)
+
       copy_k_block(_0{});
       add_delta_s(tSrS_local);
       CUTLASS_PRAGMA_UNROLL
@@ -1072,10 +1072,10 @@ struct CollectiveMainloopFwd {
       }
       pipeline_k.consumer_release(smem_pipe_read_k);
       ++smem_pipe_read_k;
-      // Non-WS refill: thread 0 issues TMA for the next K tile
+
       tma_refill.refill_k(tile_idx);
 
-      // Apply the logical mask before the online-softmax update.
+
       if constexpr (Is_causal) {
         apply_mask(tSrS_local, n_block);
       } else if (tile_idx == 0) {
@@ -1083,18 +1083,18 @@ struct CollectiveMainloopFwd {
       }
 
       if (is_first_compute) {
-        softmax_fused.template online_softmax_with_quant</*FirstTile=*/true,
-                                                         /*InfCheck=*/Is_causal>(
+        softmax_fused.template online_softmax_with_quant< true,
+                                                         Is_causal>(
             tSrS_local, AbsMaxP, mainloop_params.softmax_scale_log2);
       } else {
         softmax_fused
-            .template online_softmax_with_quant_direct_norm_nonfirst</*InfCheck=*/Is_causal>(
+            .template online_softmax_with_quant_direct_norm_nonfirst< Is_causal>(
                 tSrS_local, AbsMaxP, mainloop_params.softmax_scale_log2);
       }
 
-      // --- V: wait, PV GEMM, release ---
-      // R19 PV ordering: WG1 first (it finished QK+softmax first via math_order).
-      // WG1's PV overlaps with WG0's remaining softmax → TC stays busy.
+
+
+
       if (!is_first_compute) {
         softmax_fused.rescale_o_inplace(tOrO_store);
       }
@@ -1114,7 +1114,7 @@ struct CollectiveMainloopFwd {
       is_first_compute = false;
       pipeline_v.consumer_release(smem_pipe_read_v);
       ++smem_pipe_read_v;
-      // Non-WS refill: thread 0 issues TMA for the next V tile
+
       tma_refill.refill_v(tile_idx);
     }
 
@@ -1123,4 +1123,4 @@ struct CollectiveMainloopFwd {
   }
 };
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}

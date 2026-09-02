@@ -36,17 +36,17 @@ inline constexpr int kPersistentGridMultiplierNonCausal = 2;
 inline constexpr int kPersistentGridMultiplierCausal = 4;
 inline constexpr int kSingleTileSchedulerMBlocks = 32;
 
-/**
- * Kernel Launcher
- *
- *
- */
+
+
+
+
+
 template <typename Kernel_traits, bool Is_causal, bool ReturnLSE, typename Scheduler>
 void run_flash_fwd_with_scheduler(Flash_fwd_params& params, cudaStream_t stream) {
   using Element = typename Kernel_traits::Element;
   using ElementSF = typename Kernel_traits::ElementSF;
   using ElementPV = typename Kernel_traits::ElementPV;
-  using ElementSFPV = typename Kernel_traits::ElementSFPV;  // V SF: UE4M3 (PV path)
+  using ElementSFPV = typename Kernel_traits::ElementSFPV;
   using ElementOut = typename Kernel_traits::ElementOut;
   using ElementDS = typename Kernel_traits::ElementDS;
   using TileShape_MNK = typename Kernel_traits::TileShape_MNK;
@@ -56,46 +56,46 @@ void run_flash_fwd_with_scheduler(Flash_fwd_params& params, cudaStream_t stream)
       qk_mxfp8_pv_nvfp4_attention::CollectiveMainloopFwd<Kernel_traits, Is_causal>;
   using CollectiveEpilogue = qk_mxfp8_pv_nvfp4_attention::CollectiveEpilogueFwd<Kernel_traits>;
   typename CollectiveMainloop::Params mainloop_params = CollectiveMainloop::to_underlying_arguments(
-      {// Q tensor
+      {
        static_cast<Element const*>(params.q_ptr),
-       {params.seqlen_q, params.d, params.h, params.b},  // shape_Q
+       {params.seqlen_q, params.d, params.h, params.b},
        {params.unpadded_seqlen_q, params.d, params.h, params.b},
-       {params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride},  // stride_Q
+       {params.q_row_stride, _1{}, params.q_head_stride, params.q_batch_stride},
 
-       // K tensor
+
        static_cast<Element const*>(params.k_ptr),
-       {params.seqlen_k, params.d, params.h_k, params.b},                         // shape_K
-       {params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride},  // stride_K
-       {params.unpadded_seqlen_k, params.d, params.h_k, params.b},  // shape_K (unpadded)
+       {params.seqlen_k, params.d, params.h_k, params.b},
+       {params.k_row_stride, _1{}, params.k_head_stride, params.k_batch_stride},
+       {params.unpadded_seqlen_k, params.d, params.h_k, params.b},
 
-       // V tensor (transposed, FP4 packed)
+
        static_cast<ElementPV const*>(params.v_ptr),
-       {params.d, params.seqlen_k, params.h_k, params.b},                         // shape_Vt
-       {params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride},  // stride_Vt
+       {params.d, params.seqlen_k, params.h_k, params.b},
+       {params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride},
 
-       // Scale factors
+
        static_cast<ElementSF const*>(params.sfq_ptr),
-       {params.seqlen_q, params.d, params.h, params.b},  // shape_SFQ
+       {params.seqlen_q, params.d, params.h, params.b},
        static_cast<ElementSF const*>(params.sfk_ptr),
-       {params.seqlen_k, params.d, params.h_k, params.b},  // shape_SFK
-       static_cast<ElementSFPV const*>(params.sfv_ptr),    // V SF: UE4M3 (PV path)
-       {params.d, params.seqlen_k, params.h_k, params.b},  // shape_SFVt
+       {params.seqlen_k, params.d, params.h_k, params.b},
+       static_cast<ElementSFPV const*>(params.sfv_ptr),
+       {params.d, params.seqlen_k, params.h_k, params.b},
 
-       // Delta_s correction
+
        cutlass::FastDivmod(params.h_h_k_ratio),
-       // Softmax scale
+
        params.scale_softmax_log2});
 
   typename CollectiveEpilogue::Params epilogue_params =
       CollectiveEpilogue::to_underlying_arguments({
-          // O tensor
-          static_cast<ElementOut*>(params.o_ptr),
-          {params.seqlen_q, params.d, params.h, params.b},                           // shape_O
-          {params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride},  // stride_O
 
-          // LSE (LogSumExp) tensor
+          static_cast<ElementOut*>(params.o_ptr),
+          {params.seqlen_q, params.d, params.h, params.b},
+          {params.o_row_stride, _1{}, params.o_head_stride, params.o_batch_stride},
+
+
           static_cast<float*>(params.softmax_lse_ptr),
-          {_1{}, params.seqlen_q, params.h * params.seqlen_q},  // stride_LSE
+          {_1{}, params.seqlen_q, params.h * params.seqlen_q},
       });
 
   int num_blocks_m = cutlass::ceil_div(params.seqlen_q, Kernel_traits::kBlockM);
@@ -162,14 +162,14 @@ void run_flash_fwd(Flash_fwd_params& params, cudaStream_t stream) {
   }
 }
 
-/**
- * MHA Forward Dispatcher
- *
- *
- * @tparam T: FP4 pair type
- * @tparam Headdim: Head dimension (64 or 128)
- * @tparam O: Output type (bfloat16 or float16)
- */
+
+
+
+
+
+
+
+
 template <typename T, int Headdim, typename O = cutlass::bfloat16_t, typename DS = float,
           bool ReturnLSE = true>
 void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
@@ -181,17 +181,17 @@ void run_mha_fwd_(Flash_fwd_params& params, cudaStream_t stream) {
   });
 }
 
-/**
- *
- * - Headdim: Head dimension (64 or 128)
- * - kStages: 3 (Pipeline stages for K/V)
- * - T: FP4 pair type
- * - O: Output type (BF16/FP16)
- *
- * Scheduler:
- *
- * Shared Memory:
- *
- */
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+
+
+
+
+
+
+
+
+
+
+
+
+}

@@ -10,16 +10,16 @@
 
 namespace qk_mxfp8_pv_nvfp4_attention {
 
-/**
- *
- *
- *
- */
 
-/**
- *
- *
- */
+
+
+
+
+
+
+
+
+
 CUTLASS_DEVICE void packed_float_to_ue4m3(float const& f0, float const& f1, float const& f2,
                                           float const& f3, uint32_t& out) {
   asm volatile(
@@ -34,10 +34,10 @@ CUTLASS_DEVICE void packed_float_to_ue4m3(float const& f0, float const& f1, floa
       : "f"(f0), "f"(f1), "f"(f2), "f"(f3));
 }
 
-/**
- *
- *
- */
+
+
+
+
 CUTLASS_DEVICE void packed_float_to_e2m1(float const& f0, float const& f1, float const& f2,
                                          float const& f3, float const& f4, float const& f5,
                                          float const& f6, float const& f7, uint32_t& out) {
@@ -57,17 +57,17 @@ CUTLASS_DEVICE void packed_float_to_e2m1(float const& f0, float const& f1, float
       : "f"(f0), "f"(f1), "f"(f2), "f"(f3), "f"(f4), "f"(f5), "f"(f6), "f"(f7));
 }
 
-/**
- * FP8 E4M3 Converter
- *
- */
+
+
+
+
 template <int N>
 struct FP8E4M3Converter {
   static_assert(N % 4 == 0, "N must be multiple of 4");
 
-  /**
-   *
-   */
+
+
+
   __device__ __forceinline__ static void convert(float const inputs[N], uint32_t outputs[N / 4]) {
 #pragma unroll
     for (int i = 0; i < N / 4; ++i) {
@@ -77,17 +77,17 @@ struct FP8E4M3Converter {
   }
 };
 
-/**
- * FP4 E2M1 Converter
- *
- */
+
+
+
+
 template <int N>
 struct FP4E2M1Converter {
   static_assert(N % 8 == 0, "N must be multiple of 8");
 
-  /**
-   *
-   */
+
+
+
   __device__ __forceinline__ static void convert(float const inputs[N], uint32_t outputs[N / 8]) {
 #pragma unroll
     for (int i = 0; i < N / 8; ++i) {
@@ -98,4 +98,4 @@ struct FP4E2M1Converter {
   }
 };
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}

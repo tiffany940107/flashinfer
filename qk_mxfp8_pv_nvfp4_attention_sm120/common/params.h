@@ -144,4 +144,4 @@ struct Flash_fwd_params : public Qkv_params {
   int* __restrict__ tile_count_semaphore;
 };
 
-}  // namespace qk_mxfp8_pv_nvfp4_attention
+}
