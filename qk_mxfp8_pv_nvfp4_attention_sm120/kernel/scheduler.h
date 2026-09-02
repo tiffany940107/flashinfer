@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2025 by SageAttention team.
+ * Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  *
  * This code is based on FlashAttention-3:
  * https://github.com/Dao-AILab/flash-attention
