@@ -37,6 +37,7 @@ import flashinfer
 from flashinfer.mla._sparse_mla_sm120 import (
     _SparseMLAPagedAttentionRunner,
     _sparse_mla_sm120_paged_attention as sparse_mla_sm120_paged_attention,
+    sparse_mla_sm120_decode_dsv4,
 )
 from flashinfer.utils import is_sm12x_supported
 
@@ -44,6 +45,11 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")),
     reason="Sparse-MLA SM120 requires SM12x.",
 )
+
+
+_DSV4_MXFP8_DATA_BYTES = 576
+_DSV4_MXFP8_SCALE_BYTES = 16
+_DSV4_MXFP8_BYTES_PER_TOKEN = _DSV4_MXFP8_DATA_BYTES + _DSV4_MXFP8_SCALE_BYTES
 
 
 # Quantization helpers.
@@ -114,6 +120,11 @@ def quantize_kv_dsv4(kv_bf16: torch.Tensor) -> torch.Tensor:
     return _quantize_kv_footer(kv_bf16, 448, 64, 64, 8)
 
 
+def quantize_kv_dsv4_mxfp8(kv_bf16: torch.Tensor) -> torch.Tensor:
+    """Pack bf16 KV into standard MXFP8 (E4M3 + UE8M0 g32) format."""
+    return _quantize_kv_footer(kv_bf16, 448, 64, 32, 16)
+
+
 def quantize_kv_dots3_swa(kv_bf16: torch.Tensor) -> torch.Tensor:
     """Pack bf16 KV into DOTS3_SWA FP8 FOOTER format (1160 B/token)."""
     return _quantize_kv_footer(kv_bf16, 1024, 64, 128, 8)
@@ -156,6 +167,11 @@ def _dequantize_kv_footer(
 def dequantize_kv_dsv4(packed: torch.Tensor) -> torch.Tensor:
     """Unpack DSV4 FP8 FOOTER → bf16. Inverse of :func:`quantize_kv_dsv4`."""
     return _dequantize_kv_footer(packed, 448, 64, 64, 8)
+
+
+def dequantize_kv_dsv4_mxfp8(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack DSV4 MXFP8 g32 FOOTER → bf16."""
+    return _dequantize_kv_footer(packed, 448, 64, 32, 16)
 
 
 def dequantize_kv_dots3_swa(packed: torch.Tensor) -> torch.Tensor:
@@ -456,6 +472,436 @@ def test_sparse_mla_sm120_decode_dsv4(
         mid_lse=mid_lse,
     )
 
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_tokens,num_heads,topk", [(1, 8, 128), (16, 64, 256)])
+def test_sparse_mla_sm120_decode_dsv4_mxfp8(
+    num_tokens: int, num_heads: int, topk: int
+) -> None:
+    """DSv4 decode with standard MXFP8 per-32 KV and online-Q scales."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk = d_v = 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks,
+            page_block_size,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4_mxfp8(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_mxfp8(kv_packed)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_cache_format="mxfp8",
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_mxfp8_full_page_pack_matches_reference() -> None:
+    torch.manual_seed(0)
+    latent_kv = (
+        torch.randn(2, 64, 1, 512, device="cuda", dtype=torch.bfloat16) / 10.0
+    ).clamp(-1, 1)
+    expected = quantize_kv_dsv4_mxfp8(latent_kv)
+    actual = flashinfer.mla.mxfp8_quantize_pack_sparse_mla_cache(
+        latent_kv, kv_layout="NHD"
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_sparse_mla_sm120_mxfp8_append_matches_full_page_pack(
+    index_dtype: torch.dtype,
+) -> None:
+    torch.manual_seed(0)
+    num_pages, page_size = 2, 64
+    latent_kv = (
+        torch.randn(num_pages, page_size, 1, 512, device="cuda", dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    expected = flashinfer.mla.mxfp8_quantize_pack_sparse_mla_cache(
+        latent_kv, kv_layout="NHD"
+    )
+    slots = torch.randperm(num_pages * page_size, device="cuda", dtype=torch.int64).to(
+        index_dtype
+    )
+    rows = latent_kv.view(-1, 512)[slots.long()].contiguous()
+    actual = torch.empty_like(expected)
+    flashinfer.mla.mxfp8_quantize_append_sparse_mla_cache(rows, slots, actual)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("page_size", [2, 64])
+def test_sparse_mla_sm120_mxfp8_append_accepts_page_stride(page_size: int) -> None:
+    """Padded vLLM page strides preserve each opaque MXFP8 page payload."""
+    torch.manual_seed(9 + page_size)
+    num_pages = 3
+    latent_kv = torch.randn(
+        num_pages, page_size, 512, dtype=torch.bfloat16, device="cuda"
+    )
+    expected = flashinfer.mla.mxfp8_quantize_pack_sparse_mla_cache(
+        latent_kv, kv_layout="NHD"
+    ).squeeze(2)
+    logical_page_bytes = page_size * _DSV4_MXFP8_BYTES_PER_TOKEN
+    page_stride = logical_page_bytes + 16
+    backing = torch.full(
+        (num_pages * page_stride,), 0xA5, dtype=torch.uint8, device="cuda"
+    )
+    actual = torch.as_strided(
+        backing,
+        size=(num_pages, page_size, _DSV4_MXFP8_BYTES_PER_TOKEN),
+        stride=(page_stride, _DSV4_MXFP8_BYTES_PER_TOKEN, 1),
+    )
+    slots = torch.arange(num_pages * page_size, dtype=torch.int64, device="cuda")
+
+    flashinfer.mla.mxfp8_quantize_append_sparse_mla_cache(
+        latent_kv.reshape(-1, 512), slots, actual
+    )
+
+    for page in range(num_pages):
+        torch.testing.assert_close(
+            actual[page].reshape(-1), expected[page].reshape(-1), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize(
+    ("misaligned", "expected_error"),
+    [
+        ("input", "latent_kv.*16"),
+        ("cache_base", "cache.*16"),
+        ("page_stride", "page stride.*16"),
+        ("entry_stride", "entries.*592"),
+    ],
+)
+def test_sparse_mla_sm120_mxfp8_append_rejects_unsafe_vector_layouts(
+    misaligned: str, expected_error: str
+) -> None:
+    """BF16/uint4 vector accesses reject misaligned or padded token rows."""
+    latent_kv = torch.empty(1, 512, dtype=torch.bfloat16, device="cuda")
+    slots = torch.zeros(1, dtype=torch.int32, device="cuda")
+    cache = torch.empty(
+        2, 2, _DSV4_MXFP8_BYTES_PER_TOKEN, dtype=torch.uint8, device="cuda"
+    )
+
+    if misaligned == "input":
+        input_storage = torch.empty(513, dtype=torch.bfloat16, device="cuda")
+        latent_kv = input_storage[1:].view(1, 512)
+    elif misaligned == "cache_base":
+        cache_storage = torch.empty(cache.numel() + 1, dtype=torch.uint8, device="cuda")
+        cache = cache_storage[1:].view_as(cache)
+    elif misaligned == "page_stride":
+        page_stride = 2 * _DSV4_MXFP8_BYTES_PER_TOKEN + 1
+        cache_storage = torch.empty(
+            page_stride + 2 * _DSV4_MXFP8_BYTES_PER_TOKEN,
+            dtype=torch.uint8,
+            device="cuda",
+        )
+        cache = torch.as_strided(
+            cache_storage,
+            size=(2, 2, _DSV4_MXFP8_BYTES_PER_TOKEN),
+            stride=(page_stride, _DSV4_MXFP8_BYTES_PER_TOKEN, 1),
+        )
+    else:
+        entry_stride = _DSV4_MXFP8_BYTES_PER_TOKEN + 16
+        page_stride = 2 * entry_stride
+        cache_storage = torch.empty(2 * page_stride, dtype=torch.uint8, device="cuda")
+        cache = torch.as_strided(
+            cache_storage,
+            size=(2, 2, _DSV4_MXFP8_BYTES_PER_TOKEN),
+            stride=(page_stride, entry_stride, 1),
+        )
+
+    with pytest.raises(RuntimeError, match=expected_error):
+        flashinfer.mla.mxfp8_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
+
+
+@pytest.mark.parametrize("num_tokens", [4, 257])
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+def test_sparse_mla_sm120_mxfp8_append_duplicate_slots_use_first_row(
+    num_tokens: int, slot_dtype: torch.dtype
+) -> None:
+    """Both append algorithms deterministically select the first valid row."""
+    torch.manual_seed(20260907 + num_tokens)
+    latent_kv = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+    slots = torch.full((num_tokens,), -1, dtype=slot_dtype, device="cuda")
+    slots[0] = 0
+    slots[-1] = 0
+    cache = torch.full(
+        (1, 2, _DSV4_MXFP8_BYTES_PER_TOKEN),
+        0xA5,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+
+    flashinfer.mla.mxfp8_quantize_append_sparse_mla_cache(latent_kv, slots, cache)
+    expected = flashinfer.mla.mxfp8_quantize_pack_sparse_mla_cache(
+        latent_kv[:1].view(1, 1, 512), kv_layout="NHD"
+    ).reshape(-1)
+    actual = cache.reshape(-1)
+
+    torch.testing.assert_close(
+        actual[:_DSV4_MXFP8_DATA_BYTES],
+        expected[:_DSV4_MXFP8_DATA_BYTES],
+        rtol=0,
+        atol=0,
+    )
+    scale_offset = 2 * _DSV4_MXFP8_DATA_BYTES
+    torch.testing.assert_close(
+        actual[scale_offset : scale_offset + _DSV4_MXFP8_SCALE_BYTES],
+        expected[_DSV4_MXFP8_DATA_BYTES:_DSV4_MXFP8_BYTES_PER_TOKEN],
+        rtol=0,
+        atol=0,
+    )
+    assert torch.all(
+        actual[_DSV4_MXFP8_DATA_BYTES : 2 * _DSV4_MXFP8_DATA_BYTES] == 0xA5
+    )
+    assert torch.all(
+        actual[
+            scale_offset + _DSV4_MXFP8_SCALE_BYTES : scale_offset
+            + 2 * _DSV4_MXFP8_SCALE_BYTES
+        ]
+        == 0xA5
+    )
+
+
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+@pytest.mark.parametrize("unsafe_layout", ["cache_base", "page_stride", "entry_stride"])
+def test_sparse_mla_sm120_mxfp8_attention_rejects_unsafe_cache_layouts(
+    phase: str, unsafe_layout: str
+) -> None:
+    """Both MXFP8 attention bindings validate their vectorized cache ABI."""
+    num_tokens = 1 if phase == "decode" else 65
+    num_pages, page_size, num_heads, topk = 2, 64, 8, 128
+    logical_page_bytes = page_size * _DSV4_MXFP8_BYTES_PER_TOKEN
+    cache = torch.empty(
+        num_pages,
+        page_size,
+        _DSV4_MXFP8_BYTES_PER_TOKEN,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    if unsafe_layout == "cache_base":
+        storage = torch.empty(cache.numel() + 1, dtype=torch.uint8, device="cuda")
+        cache = storage[1:].view_as(cache)
+    elif unsafe_layout == "page_stride":
+        page_stride = logical_page_bytes + 1
+        storage = torch.empty(num_pages * page_stride, dtype=torch.uint8, device="cuda")
+        cache = torch.as_strided(
+            storage,
+            size=(num_pages, page_size, _DSV4_MXFP8_BYTES_PER_TOKEN),
+            stride=(page_stride, _DSV4_MXFP8_BYTES_PER_TOKEN, 1),
+        )
+    else:
+        entry_stride = _DSV4_MXFP8_BYTES_PER_TOKEN + 16
+        page_stride = page_size * entry_stride
+        storage = torch.empty(num_pages * page_stride, dtype=torch.uint8, device="cuda")
+        cache = torch.as_strided(
+            storage,
+            size=(num_pages, page_size, _DSV4_MXFP8_BYTES_PER_TOKEN),
+            stride=(page_stride, entry_stride, 1),
+        )
+
+    q = torch.zeros(num_tokens, num_heads, 512, dtype=torch.bfloat16, device="cuda")
+    indices = torch.zeros(num_tokens, topk, dtype=torch.int32, device="cuda")
+    output = torch.empty_like(q)
+    out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device="cuda")
+
+    with pytest.raises(RuntimeError, match=r"kv_cache.*(aligned|stride)"):
+        if phase == "decode":
+            mid_out, mid_lse = _make_decode_scratch(
+                num_tokens, num_heads, topk, 512, torch.device("cuda")
+            )
+            sparse_mla_sm120_decode_dsv4(
+                q,
+                cache,
+                indices,
+                mid_out,
+                mid_lse,
+                output,
+                out_lse,
+                512**-0.5,
+                kv_cache_format="mxfp8",
+                chunks_per_block=1,
+            )
+        else:
+            sparse_mla_sm120_paged_attention(
+                q,
+                cache,
+                indices,
+                output,
+                out_lse,
+                512**-0.5,
+                kv_cache_format="mxfp8",
+                prefill_impl="mg",
+            )
+
+
+@pytest.mark.parametrize("num_tokens", [4, 257])
+def test_sparse_mla_sm120_mxfp8_append_cuda_graph(num_tokens: int) -> None:
+    """Single- and three-launch append policies both support graph replay."""
+    torch.manual_seed(20260908 + num_tokens)
+    latent_kv = torch.randn(num_tokens, 512, dtype=torch.bfloat16, device="cuda")
+    slots = torch.full((num_tokens,), -1, dtype=torch.int32, device="cuda")
+    slots[0] = 0
+    slots[-1] = 0
+    expected = torch.full(
+        (1, 2, _DSV4_MXFP8_BYTES_PER_TOKEN),
+        0xA5,
+        dtype=torch.uint8,
+        device="cuda",
+    )
+    actual = torch.full_like(expected, 0xA5)
+    flashinfer.mla.mxfp8_quantize_append_sparse_mla_cache(latent_kv, slots, expected)
+    # Warm the custom-op/JIT path before capture.
+    flashinfer.mla.mxfp8_quantize_append_sparse_mla_cache(latent_kv, slots, actual)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        flashinfer.mla.mxfp8_quantize_append_sparse_mla_cache(latent_kv, slots, actual)
+
+    actual.fill_(0xA5)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("phase", ["decode", "prefill"])
+def test_sparse_mla_sm120_mxfp8_attention_cuda_graph(phase: str) -> None:
+    """MXFP8 split-K decode and streaming prefill replay fresh inputs."""
+    torch.manual_seed(20260910 if phase == "decode" else 20260911)
+    num_tokens = 8 if phase == "decode" else 128
+    num_heads, topk, num_pages, page_size = 8, 128, 4, 64
+    latent_kv = (
+        torch.randn(
+            num_pages,
+            page_size,
+            1,
+            512,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    cache = flashinfer.mla.mxfp8_quantize_pack_sparse_mla_cache(
+        latent_kv, kv_layout="NHD"
+    )
+    dequant = dequantize_kv_dsv4_mxfp8(cache)
+
+    def make_inputs() -> tuple[torch.Tensor, torch.Tensor]:
+        q = (
+            torch.randn(
+                num_tokens,
+                num_heads,
+                512,
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+            / 10.0
+        ).clamp(-1, 1)
+        indices = torch.randint(
+            0,
+            num_pages * page_size,
+            (num_tokens, topk),
+            dtype=torch.int32,
+            device="cuda",
+        )
+        indices[:, topk // 2 :] = -1
+        return q, indices
+
+    q_static, indices_static = make_inputs()
+    q_replay, indices_replay = make_inputs()
+    output = torch.zeros_like(q_static)
+    out_lse = torch.zeros(num_tokens, num_heads, dtype=torch.float32, device="cuda")
+    ref_out, ref_lse = _ref_sparse_attn(
+        q_replay, dequant, indices_replay, 512**-0.5, 512
+    )
+    mid_out = mid_lse = None
+    if phase == "decode":
+        mid_out, mid_lse = _make_decode_scratch(
+            num_tokens, num_heads, topk, 512, torch.device("cuda")
+        )
+
+    def run() -> None:
+        if phase == "decode":
+            assert mid_out is not None and mid_lse is not None
+            sparse_mla_sm120_decode_dsv4(
+                q_static,
+                cache,
+                indices_static,
+                mid_out,
+                mid_lse,
+                output,
+                out_lse,
+                512**-0.5,
+                kv_cache_format="mxfp8",
+                chunks_per_block=1,
+            )
+        else:
+            sparse_mla_sm120_paged_attention(
+                q_static,
+                cache,
+                indices_static,
+                output,
+                out_lse,
+                512**-0.5,
+                kv_cache_format="mxfp8",
+                prefill_impl="mg",
+            )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            run()
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+
+    q_static.copy_(q_replay)
+    indices_static.copy_(indices_replay)
+    output.zero_()
+    out_lse.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
@@ -1147,17 +1593,23 @@ def test_sparse_mla_sm120_decode_row_strided_indices(family: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "num_heads,topk,num_tokens,kv_layout",
+    "num_heads,topk,num_tokens,kv_layout,kv_cache_format",
     [
-        (32, 128, 7, "NHD"),
-        (32, 192, 7, "HND"),
-        (32, 256, 7, "HND"),
-        (8, 192, 128, "HND"),
-        (8, 256, 128, "HND"),
+        (32, 128, 7, "NHD", "fp8"),
+        (32, 192, 7, "HND", "fp8"),
+        (32, 256, 7, "HND", "fp8"),
+        (8, 192, 128, "HND", "fp8"),
+        (8, 256, 128, "HND", "fp8"),
+        (32, 128, 7, "NHD", "mxfp8"),
+        (8, 256, 128, "HND", "mxfp8"),
     ],
 )
 def test_sparse_mla_sm120_dsv4_public_api(
-    num_heads: int, topk: int, num_tokens: int, kv_layout: str
+    num_heads: int,
+    topk: int,
+    num_tokens: int,
+    kv_layout: str,
+    kv_cache_format: str,
 ) -> None:
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -1172,8 +1624,14 @@ def test_sparse_mla_sm120_dsv4_public_api(
         )
         / 10.0
     ).clamp(-1, 1)
-    kv_packed = quantize_kv_dsv4(kv_bf16)
-    kv_dequant = dequantize_kv_dsv4(kv_packed)
+    quantize_kv = (
+        quantize_kv_dsv4_mxfp8 if kv_cache_format == "mxfp8" else quantize_kv_dsv4
+    )
+    dequantize_kv = (
+        dequantize_kv_dsv4_mxfp8 if kv_cache_format == "mxfp8" else dequantize_kv_dsv4
+    )
+    kv_packed = quantize_kv(kv_bf16)
+    kv_dequant = dequantize_kv(kv_packed)
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -1200,6 +1658,7 @@ def test_sparse_mla_sm120_dsv4_public_api(
         swa_topk_lens=swa_topk_lens,
         bmm1_scale=sm_scale,
         kv_layout=kv_layout,
+        kv_cache_format=kv_cache_format,
     )
 
     torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
@@ -1215,6 +1674,7 @@ def test_sparse_mla_sm120_dsv4_public_api(
         swa_topk_lens=swa_topk_lens,
         bmm1_scale=sm_scale,
         kv_layout=kv_layout,
+        kv_cache_format=kv_cache_format,
     )
     assert returned.data_ptr() == out_buffer.data_ptr()
     torch.testing.assert_close(out_buffer.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
@@ -1229,6 +1689,7 @@ def test_sparse_mla_sm120_dsv4_public_api(
             swa_topk_lens=swa_topk_lens,
             bmm1_scale=sm_scale,
             kv_layout=kv_layout,
+            kv_cache_format=kv_cache_format,
         )
 
 
@@ -1953,6 +2414,62 @@ def test_sparse_mla_sm120_prefill_dsv4(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.parametrize("num_tokens,num_heads,topk", [(65, 8, 128), (128, 64, 512)])
+def test_sparse_mla_sm120_prefill_dsv4_mxfp8(
+    num_tokens: int, num_heads: int, topk: int
+) -> None:
+    """DSv4 streaming prefill with standard MXFP8 per-32 KV scales."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk = d_v = 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks,
+            page_block_size,
+            1,
+            d_qk,
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4_mxfp8(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4_mxfp8(kv_packed)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        kv_cache_format="mxfp8",
+        prefill_impl="mg",
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
 @pytest.mark.parametrize("num_heads", [8, 32])
 @pytest.mark.parametrize("topk", [192, 256])
 def test_sparse_mla_sm120_prefill_dsv4_topk_length_truncation(
@@ -2370,25 +2887,32 @@ def test_sparse_mla_sm120_runner_wide_lse_buffer() -> None:
 
 _DSV4_PREFILL_DUAL_HEADS = [8, 16, 32, 64, 128]
 
-# (num_heads, topk, extra_topk, extra_pbs). topk=512: DeepSeek V4 Vision
+# (num_heads, topk, extra_topk, extra_pbs, kv_cache_format). topk=512: DeepSeek V4 Vision
 # primary candidate set (H=32/64 shards, both extra-cache page layouts).
 _DSV4_PREFILL_DUAL_CONFIGS = [
-    (num_heads, 128, extra_topk, extra_pbs)
+    (num_heads, 128, extra_topk, extra_pbs, "fp8")
     for num_heads in _DSV4_PREFILL_DUAL_HEADS
     for extra_topk, extra_pbs in [(128, 64), (512, 64), (512, 2)]
 ] + [
-    (32, 512, 512, 64),
-    (32, 512, 128, 2),
-    (64, 512, 512, 64),
-    (64, 512, 128, 2),
+    (32, 512, 512, 64, "fp8"),
+    (32, 512, 128, 2, "fp8"),
+    (64, 512, 512, 64, "fp8"),
+    (64, 512, 128, 2, "fp8"),
+    (8, 128, 128, 64, "mxfp8"),
+    (64, 512, 128, 2, "mxfp8"),
 ]
 
 
 @pytest.mark.parametrize(
-    "num_heads,topk,extra_topk,extra_pbs", _DSV4_PREFILL_DUAL_CONFIGS
+    "num_heads,topk,extra_topk,extra_pbs,kv_cache_format",
+    _DSV4_PREFILL_DUAL_CONFIGS,
 )
 def test_sparse_mla_sm120_prefill_dsv4_dual(
-    num_heads: int, topk: int, extra_topk: int, extra_pbs: int
+    num_heads: int,
+    topk: int,
+    extra_topk: int,
+    extra_pbs: int,
+    kv_cache_format: str,
 ) -> None:
     """DSv4 dual-cache prefill."""
     torch.manual_seed(0)
@@ -2408,8 +2932,14 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
         )
         / 10.0
     ).clamp(-1, 1)
-    main_packed = quantize_kv_dsv4(main_bf16)
-    main_dequant = dequantize_kv_dsv4(main_packed)
+    quantize_kv = (
+        quantize_kv_dsv4_mxfp8 if kv_cache_format == "mxfp8" else quantize_kv_dsv4
+    )
+    dequantize_kv = (
+        dequantize_kv_dsv4_mxfp8 if kv_cache_format == "mxfp8" else dequantize_kv_dsv4
+    )
+    main_packed = quantize_kv(main_bf16)
+    main_dequant = dequantize_kv(main_packed)
 
     extra_bf16 = (
         torch.randn(
@@ -2417,8 +2947,8 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
         )
         / 10.0
     ).clamp(-1, 1)
-    extra_packed = quantize_kv_dsv4(extra_bf16)
-    extra_dequant = dequantize_kv_dsv4(extra_packed)
+    extra_packed = quantize_kv(extra_bf16)
+    extra_dequant = dequantize_kv(extra_packed)
 
     q = (
         torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
@@ -2460,6 +2990,7 @@ def test_sparse_mla_sm120_prefill_dsv4_dual(
         out_lse,
         sm_scale,
         d_v=d_v,
+        kv_cache_format=kv_cache_format,
         attn_sink=attn_sink,
         extra_kv_cache=extra_packed,
         extra_indices=extra_idx,
@@ -3151,6 +3682,71 @@ def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
         assert (calls["decode"] == 1) == expect_decode
         torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
         torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_dual_crossover_keys_do_not_alias(monkeypatch) -> None:
+    """A single-cache threshold and each dual-cache geometry route only the
+    exact shape they calibrated."""
+    from flashinfer.mla import _sparse_mla_sm120_cpb as cpb_mod
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
+
+    device = torch.device("cuda")
+    dev_key = cpb_mod._device_key(device)
+    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.setitem(
+        cpb_mod._crossover,
+        dev_key,
+        {
+            # Forces single-cache prefill for every T > 0.
+            "dsv4_mxfp8|64|128": 0,
+            # The production main-128 + extra-512/page-2 geometry keeps
+            # decode through T=16, then crosses to streaming prefill.
+            "dsv4_mxfp8|64|128|512|2": 16,
+        },
+    )
+    monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
+    plan_mod._plan_memo.clear()
+
+    def route(
+        num_tokens: int,
+        *,
+        extra_topk: int = 0,
+        extra_page_block_size: int = 0,
+    ) -> plan_mod.KernelVariant:
+        planned = plan_mod.plan(
+            num_tokens,
+            64,
+            128,
+            plan_mod._MODEL_TYPE_DSV4_MXFP8,
+            64,
+            extra_topk > 0,
+            plan_mod._PREFILL_IMPL_AUTO,
+            device,
+            extra_topk=extra_topk,
+            extra_page_block_size=extra_page_block_size,
+        )
+        assert planned is not None
+        return planned.variant
+
+    assert route(8) is plan_mod.KernelVariant.PREFILL_MG
+    assert (
+        route(8, extra_topk=512, extra_page_block_size=2)
+        is plan_mod.KernelVariant.DECODE_SPLITK
+    )
+    assert (
+        route(32, extra_topk=512, extra_page_block_size=2)
+        is plan_mod.KernelVariant.PREFILL_MG_DUAL
+    )
+    # Neither a different page geometry nor a different extra top-k may reuse
+    # the calibrated page-2/extra-512 entry.
+    assert (
+        route(32, extra_topk=512, extra_page_block_size=64)
+        is plan_mod.KernelVariant.DECODE_SPLITK
+    )
+    assert (
+        route(32, extra_topk=128, extra_page_block_size=2)
+        is plan_mod.KernelVariant.DECODE_SPLITK
+    )
 
 
 def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:

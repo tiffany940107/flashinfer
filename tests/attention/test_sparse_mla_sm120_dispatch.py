@@ -54,6 +54,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _DECODE_DOTS3_SWA_DISPATCH,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
+    _MODEL_TYPE_DSV4_MXFP8,
     _MODEL_TYPE_GLM_NSA,
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_DOTS3_SWA,
@@ -143,6 +144,21 @@ def test_supported_configs_nvfp4_envelope() -> None:
 
     with pytest.raises(ValueError, match="kv_cache_format"):
         supported_sparse_mla_sm120_configs(kv_cache_format="int4")
+
+
+def test_supported_configs_mxfp8_envelope() -> None:
+    """MXFP8 has its own format-keyed DSV4 planner configuration."""
+    configs = supported_sparse_mla_sm120_configs(kv_cache_format="mxfp8")
+    assert set(configs) == {"dsv4"}
+    dsv4 = configs["dsv4"]
+    assert dsv4.kv_cache_format == "mxfp8"
+    assert dsv4.bytes_per_token == 592
+    assert dsv4.supported_num_heads() == tuple(range(1, 129))
+    assert dsv4.supported_topk() == (128, 192, 256, 512, 1024)
+    assert dsv4.extra_page_block_sizes == frozenset({2, 64})
+    assert dsv4.supports_decode(8, 128)
+    assert dsv4.supports_decode(64, 384)
+    assert not dsv4.supports_decode(129, 128)
 
 
 def test_nvfp4_exact_head_scratch_view() -> None:
@@ -240,6 +256,21 @@ def test_error_message_names_topk_mismatch() -> None:
     assert "supported_sparse_mla_sm120_configs" in msg
     # The matching page size must not be blamed.
     assert "page_block_size=64 is unsupported" not in msg
+
+
+def test_error_message_supports_mxfp8_family() -> None:
+    """MXFP8 dispatch diagnostics use its format-keyed DSV4 config."""
+    msg = _decode_dispatch_error_message(
+        num_tokens=5,
+        num_heads=129,
+        topk=128,
+        d_qk=512,
+        page_block_size=64,
+        model_type=_MODEL_TYPE_DSV4_MXFP8,
+        extra_topk=0,
+    )
+    assert "model_type=dsv4_mxfp8" in msg
+    assert "num_heads=129 exceeds the decode envelope [1, 128]" in msg
 
 
 def test_error_message_names_num_heads_mismatch() -> None:

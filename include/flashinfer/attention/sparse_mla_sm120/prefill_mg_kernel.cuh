@@ -1184,7 +1184,6 @@ __device__ __forceinline__ void prefill_mg_impl(
   using CT = ComputeTraits<MT, ComputeMode::FP8>;
   using LMG = SmemLayoutMG<MT, CM>;
   using SMG = SmemPtrsMG<MT, CM>;
-
   static_assert(NUM_HEADS % MG_HEADS_PER_CTA == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
                 "NUM_HEADS must fill MG_HEADS_PER_CTA, except a single padded head group");
   static constexpr int REPLICATE_H = (NUM_HEADS + MG_HEADS_PER_CTA - 1) / MG_HEADS_PER_CTA;
@@ -1720,11 +1719,17 @@ __device__ __forceinline__ void prefill_mg_impl(
         if constexpr (KV::SCALE_IN_KV_SMEM) {
           vsc_cache[vc][0] = reinterpret_cast<const float*>(e0_base + KV::D_NOPE)[vc];
           vsc_cache[vc][1] = reinterpret_cast<const float*>(e1_base + KV::D_NOPE)[vc];
-        } else {
+        } else if constexpr (CT::SCALE_GROUPS_PER_V_CHUNK == 1) {
           vsc_cache[vc][0] =
               ue8m0_to_fp32(sm.kv_scale_buf(ti & 1)[e0i * KV::SCALE_BYTES_PER_TOKEN + vc]);
           vsc_cache[vc][1] =
               ue8m0_to_fp32(sm.kv_scale_buf(ti & 1)[e1i * KV::SCALE_BYTES_PER_TOKEN + vc]);
+        } else {
+          const int first_scale = vc * CT::SCALE_GROUPS_PER_V_CHUNK;
+          vsc_cache[vc][0] =
+              ue8m0_to_fp32(sm.kv_scale_buf(ti & 1)[e0i * KV::SCALE_BYTES_PER_TOKEN + first_scale]);
+          vsc_cache[vc][1] =
+              ue8m0_to_fp32(sm.kv_scale_buf(ti & 1)[e1i * KV::SCALE_BYTES_PER_TOKEN + first_scale]);
         }
       }
 
@@ -1766,18 +1771,40 @@ __device__ __forceinline__ void prefill_mg_impl(
         warp_l_partial[g][0] += ls0;
         warp_l_partial[g][1] += ls1;
 
-        // V-scale max for W quantization.
+        // V-scale max for W quantization. Existing cache formats have one
+        // scale per scheduling chunk. MXFP8 keeps the same 64-D scheduling
+        // chunk but must conservatively cover both independent g32 scales.
 #pragma unroll
         for (int vc = 0; vc < CT::N_V_CHUNKS; vc++) {
-          float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
-          float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
-          float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
-          atomicMax(
-              reinterpret_cast<int*>(&sm.w_head_sc_all()[g * SMG::WSC_GRP_STRIDE + vc * HPB + gid]),
-              __float_as_int(fmaxf(ws00, ws01)));
-          atomicMax(reinterpret_cast<int*>(
-                        &sm.w_head_sc_all()[g * SMG::WSC_GRP_STRIDE + vc * HPB + gid + 8]),
-                    __float_as_int(fmaxf(ws10, ws11)));
+          if constexpr (CT::SCALE_GROUPS_PER_V_CHUNK == 1) {
+            const float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
+            const float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
+            const float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
+            atomicMax(reinterpret_cast<int*>(
+                          &sm.w_head_sc_all()[g * SMG::WSC_GRP_STRIDE + vc * HPB + gid]),
+                      __float_as_int(fmaxf(ws00, ws01)));
+            atomicMax(reinterpret_cast<int*>(
+                          &sm.w_head_sc_all()[g * SMG::WSC_GRP_STRIDE + vc * HPB + gid + 8]),
+                      __float_as_int(fmaxf(ws10, ws11)));
+          } else {
+            static_assert(KV::SCALE_FORMAT == ScaleFormat::UE8M0_BYTE);
+            const uint8_t* scales = sm.kv_scale_buf(ti & 1);
+            const int second_scale = vc * CT::SCALE_GROUPS_PER_V_CHUNK + 1;
+            const float max_vsc0 =
+                fmaxf(vsc_cache[vc][0],
+                      ue8m0_to_fp32(scales[e0i * KV::SCALE_BYTES_PER_TOKEN + second_scale]));
+            const float max_vsc1 =
+                fmaxf(vsc_cache[vc][1],
+                      ue8m0_to_fp32(scales[e1i * KV::SCALE_BYTES_PER_TOKEN + second_scale]));
+            const float ws00 = w0 * max_vsc0, ws01 = w1 * max_vsc1;
+            const float ws10 = w2 * max_vsc0, ws11 = w3 * max_vsc1;
+            atomicMax(reinterpret_cast<int*>(
+                          &sm.w_head_sc_all()[g * SMG::WSC_GRP_STRIDE + vc * HPB + gid]),
+                      __float_as_int(fmaxf(ws00, ws01)));
+            atomicMax(reinterpret_cast<int*>(
+                          &sm.w_head_sc_all()[g * SMG::WSC_GRP_STRIDE + vc * HPB + gid + 8]),
+                      __float_as_int(fmaxf(ws10, ws11)));
+          }
         }
       }
       bar_sync_t<2, MATH_THREADS>();
@@ -1866,35 +1893,62 @@ __device__ __forceinline__ void prefill_mg_impl(
             // W_FP8 ping-pong: writes go to buf[vc&1], reads go to same buf;
             // next vc writes to buf[(vc+1)&1] in parallel with this vc's reads.
             uint8_t* wfp8_parity = sm.w_fp8() + (vc & 1) * SMG::WFP8_PARITY_STRIDE;
-            float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
+            static_assert(CT::SCALE_GROUPS_PER_V_CHUNK == 1 || CT::SCALE_GROUPS_PER_V_CHUNK == 2);
+            const float vsc0 = vsc_cache[vc][0], vsc1 = vsc_cache[vc][1];
 #pragma unroll
             for (int g = 0; g < MG_N_HG; g++) {
               float* vc_sc = sm.w_head_sc_all() + g * SMG::WSC_GRP_STRIDE + vc * HPB;
-              uint8_t* cur_wfp8 = wfp8_parity + g * SMG::WFP8_GRP_SIZE;
-              float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
-              float w0 = w_grp[g][0], w1 = w_grp[g][1];
-              float w2 = w_grp[g][2], w3 = w_grp[g][3];
-              float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
-              float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
-              // vc_sc already bounds the normalized weights; FP8 conversion saturates rounding
-              // overshoot.
-              __nv_fp8_e4m3 f00(ws00 * si0);
-              __nv_fp8_e4m3 f01(ws01 * si0);
-              __nv_fp8_e4m3 f10(ws10 * si1);
-              __nv_fp8_e4m3 f11(ws11 * si1);
               int wrow0 = gid, wrow1 = gid + 8;
               if constexpr (USE_WFP8_ROW_XOR) {
                 wrow0 = wfp8_row_xor(wrow0);
                 wrow1 = wfp8_row_xor(wrow1);
               }
-              cur_wfp8[wrow0 * (BI + 16) + e0i] = f00.__x;
-              cur_wfp8[wrow0 * (BI + 16) + e1i] = f01.__x;
-              cur_wfp8[wrow1 * (BI + 16) + e0i] = f10.__x;
-              cur_wfp8[wrow1 * (BI + 16) + e1i] = f11.__x;
+              uint8_t* cur_wfp8 = wfp8_parity + g * SMG::WFP8_GRP_SIZE;
+              const float si0 = 1.f / vc_sc[gid], si1 = 1.f / vc_sc[gid + 8];
+              const float w0 = w_grp[g][0], w1 = w_grp[g][1];
+              const float w2 = w_grp[g][2], w3 = w_grp[g][3];
+              if constexpr (CT::SCALE_GROUPS_PER_V_CHUNK == 1) {
+                const float ws00 = w0 * vsc0, ws01 = w1 * vsc1;
+                const float ws10 = w2 * vsc0, ws11 = w3 * vsc1;
+                // vc_sc already bounds the normalized weights; FP8 conversion
+                // saturates rounding overshoot.
+                __nv_fp8_e4m3 f00(ws00 * si0);
+                __nv_fp8_e4m3 f01(ws01 * si0);
+                __nv_fp8_e4m3 f10(ws10 * si1);
+                __nv_fp8_e4m3 f11(ws11 * si1);
+                cur_wfp8[wrow0 * (BI + 16) + e0i] = f00.__x;
+                cur_wfp8[wrow0 * (BI + 16) + e1i] = f01.__x;
+                cur_wfp8[wrow1 * (BI + 16) + e0i] = f10.__x;
+                cur_wfp8[wrow1 * (BI + 16) + e1i] = f11.__x;
+              } else {
+                static_assert(KV::SCALE_FORMAT == ScaleFormat::UE8M0_BYTE);
+                const uint8_t* scales = sm.kv_scale_buf(ti & 1);
+                const int second_scale = vc * CT::SCALE_GROUPS_PER_V_CHUNK + 1;
+                const float vsc10 =
+                    ue8m0_to_fp32(scales[e0i * KV::SCALE_BYTES_PER_TOKEN + second_scale]);
+                const float vsc11 =
+                    ue8m0_to_fp32(scales[e1i * KV::SCALE_BYTES_PER_TOKEN + second_scale]);
+                // Hoist the head-row normalization shared by both g32 groups.
+                const float wn0 = w0 * si0, wn1 = w1 * si0;
+                const float wn2 = w2 * si1, wn3 = w3 * si1;
+                uint32_t fp8x4 = cvt_e4m3x4(wn0 * vsc0, wn1 * vsc1, wn2 * vsc0, wn3 * vsc1);
+                *reinterpret_cast<uint16_t*>(cur_wfp8 + wrow0 * (BI + 16) + e0i) =
+                    static_cast<uint16_t>(fp8x4);
+                *reinterpret_cast<uint16_t*>(cur_wfp8 + wrow1 * (BI + 16) + e0i) =
+                    static_cast<uint16_t>(fp8x4 >> 16);
+                cur_wfp8 += SMG::WFP8_SCALE_GRP_STRIDE;
+                fp8x4 = cvt_e4m3x4(wn0 * vsc10, wn1 * vsc11, wn2 * vsc10, wn3 * vsc11);
+                *reinterpret_cast<uint16_t*>(cur_wfp8 + wrow0 * (BI + 16) + e0i) =
+                    static_cast<uint16_t>(fp8x4);
+                *reinterpret_cast<uint16_t*>(cur_wfp8 + wrow1 * (BI + 16) + e0i) =
+                    static_cast<uint16_t>(fp8x4 >> 16);
+              }
             }
             bar_sync_t<2, MATH_THREADS>();
 
-            // Both head groups use the same V B operand for a given chunk/dim.
+            // Both head groups use the same V B operand for a given chunk/dim. MXFP8 keeps a
+            // 64-D scheduling chunk, but selects one of two independently scaled g32 W matrices
+            // from the output dimension being accumulated.
             if constexpr (MG_N_HG == 2) {
               float* vc_sc0 = sm.w_head_sc_all() + vc * HPB;
               float* vc_sc1 = sm.w_head_sc_all() + SMG::WSC_GRP_STRIDE + vc * HPB;
@@ -1904,6 +1958,12 @@ __device__ __forceinline__ void prefill_mg_impl(
               for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
                 int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
                 int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+                if constexpr (CT::SCALE_GROUPS_PER_V_CHUNK == 2) {
+                  const int sg = (dim % CT::V_CHUNK) / KV::QUANT_TILE;
+                  uint8_t* wfp8_scale_group = wfp8_parity + sg * SMG::WFP8_SCALE_GRP_STRIDE;
+                  cur_wfp8_g0 = wfp8_scale_group;
+                  cur_wfp8_g1 = wfp8_scale_group + SMG::WFP8_GRP_SIZE;
+                }
                 float xv0[4] = {0.f, 0.f, 0.f, 0.f};
                 float xv1[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
@@ -1953,6 +2013,11 @@ __device__ __forceinline__ void prefill_mg_impl(
                 for (int nt = 0; nt < CT::NT_PER_WARP_XV; nt++) {
                   int ti_acc = vc * CT::NT_PER_WARP_XV + nt;
                   int dim = vc * CT::V_CHUNK + mwarp * (CT::NT_PER_WARP_XV * 8) + nt * 8;
+                  if constexpr (CT::SCALE_GROUPS_PER_V_CHUNK == 2) {
+                    const int sg = (dim % CT::V_CHUNK) / KV::QUANT_TILE;
+                    cur_wfp8 =
+                        wfp8_parity + sg * SMG::WFP8_SCALE_GRP_STRIDE + g * SMG::WFP8_GRP_SIZE;
+                  }
                   float xv[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
                   for (int kstep = 0; kstep < CT::XV_KSTEPS; kstep++) {

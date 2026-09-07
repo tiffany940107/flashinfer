@@ -114,7 +114,9 @@ struct SmemLayout {
 template <ModelType MT, ComputeMode CM, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
 struct SmemLayoutMG {
   using KV = KVCacheTraits<MT>;
-  using CT = ComputeTraits<MT, CM, TILE_BI, TILE_MATH_WARPS>;
+  // P*V always uses the FP8 scheduling traits, including when Q*K uses the
+  // BF16 compute mode. Keep its W-buffer layout independent of the Q*K mode.
+  using CT = ComputeTraits<MT, ComputeMode::FP8, TILE_BI, TILE_MATH_WARPS>;
   static constexpr int N_HG = 2;
 
   static constexpr bool BF16_Q = (CM == ComputeMode::BF16);
@@ -135,7 +137,8 @@ struct SmemLayoutMG {
   static constexpr size_t SMEM_W_SC_ALL = N_HG * CT::N_V_CHUNKS * HPB * sizeof(float);
   // Two parities let adjacent V chunks use separate FP8 weight buffers.
   static constexpr int W_FP8_PARITIES = 2;
-  static constexpr size_t SMEM_W_FP8_MG = W_FP8_PARITIES * N_HG * HPB * (TILE_BI + 16);
+  static constexpr size_t SMEM_W_FP8_MG =
+      W_FP8_PARITIES * CT::SCALE_GROUPS_PER_V_CHUNK * N_HG * HPB * (TILE_BI + 16);
   // q_rope is only needed before the main loop; reuse the W_FP8 region.
   static_assert(N_HG * HPB * KV::D_ROPE * sizeof(bf16) <= SMEM_W_FP8_MG);
   static constexpr size_t SMEM_SCRATCH = 0;
@@ -166,15 +169,16 @@ struct SmemLayoutMG {
 template <ModelType MT, ComputeMode CM, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
 struct SmemPtrsMG {
   using LMG = SmemLayoutMG<MT, CM, TILE_BI, TILE_MATH_WARPS>;
-  using CT = ComputeTraits<MT, CM, TILE_BI, TILE_MATH_WARPS>;
+  using CT = ComputeTraits<MT, ComputeMode::FP8, TILE_BI, TILE_MATH_WARPS>;
 
   static constexpr int N_HG = LMG::N_HG;
   static constexpr int REDUCE_GRP_STRIDE = TILE_MATH_WARPS * HPB;
   static constexpr int ML_GRP_STRIDE = HPB;
   static constexpr int WSC_GRP_STRIDE = CT::N_V_CHUNKS * HPB;
   static constexpr int WFP8_GRP_SIZE = HPB * (TILE_BI + 16);
+  static constexpr int WFP8_SCALE_GRP_STRIDE = LMG::N_HG * WFP8_GRP_SIZE;
   // Stride between W_FP8 ping-pong parities.
-  static constexpr int WFP8_PARITY_STRIDE = LMG::N_HG * WFP8_GRP_SIZE;
+  static constexpr int WFP8_PARITY_STRIDE = CT::SCALE_GROUPS_PER_V_CHUNK * WFP8_SCALE_GRP_STRIDE;
 
   char* base;
 

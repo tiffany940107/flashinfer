@@ -70,6 +70,7 @@ _MODEL_TYPE_DSV4 = 1
 _MODEL_TYPE_GLM_NSA = 2
 _MODEL_TYPE_GLM53_NOPE = 3
 _MODEL_TYPE_DOTS3_SWA = 4
+_MODEL_TYPE_DSV4_MXFP8 = 5
 # The V32 kernel family: the 656B/token inline-scale cache ABI. GLM53_NOPE is
 # the rope-free member (d_qk=512; bytes [528:656) are reserved padding).
 # swapAB is instantiated for all V32 model types.
@@ -78,6 +79,7 @@ _V32_MODEL_TYPES = frozenset(
 )
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
+_BPT_DSV4_MXFP8 = 592
 _BPT_DOTS3_SWA = 1160
 
 # d_v per model type. Every DeepSeek-family type is 512; DOTS3_SWA is the one
@@ -85,6 +87,7 @@ _BPT_DOTS3_SWA = 1160
 _D_V_BY_MODEL_TYPE = {
     _MODEL_TYPE_DSV3_2: 512,
     _MODEL_TYPE_DSV4: 512,
+    _MODEL_TYPE_DSV4_MXFP8: 512,
     _MODEL_TYPE_GLM_NSA: 512,
     _MODEL_TYPE_GLM53_NOPE: 512,
     _MODEL_TYPE_DOTS3_SWA: 1024,
@@ -94,6 +97,7 @@ _D_V_BY_MODEL_TYPE = {
 _MODEL_TYPE_TO_FAMILY = {
     _MODEL_TYPE_DSV3_2: "dsv3_2",
     _MODEL_TYPE_DSV4: "dsv4",
+    _MODEL_TYPE_DSV4_MXFP8: "dsv4_mxfp8",
     _MODEL_TYPE_GLM_NSA: "glm_nsa",
     _MODEL_TYPE_GLM53_NOPE: "glm53_nope",
     _MODEL_TYPE_DOTS3_SWA: "dots3_swa",
@@ -151,6 +155,7 @@ class _DecodeDispatchEnvelope:
 
 
 _DECODE_DSV4_DISPATCH = _DecodeDispatchEnvelope(1)
+_DECODE_DSV4_MXFP8_DISPATCH = _DecodeDispatchEnvelope(1)
 
 # decode-dsv3_2 eligibility (shared with GLM-NSA).
 _DECODE_DSV3_2_DISPATCH = _DecodeDispatchEnvelope(1)
@@ -171,6 +176,7 @@ _DECODE_DOTS3_SWA_DISPATCH = _DecodeDispatchEnvelope(513)
 # Any width >= min_topk above is served; these are the values with measured
 # crossover data.
 _DECODE_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024})
+_DECODE_DSV4_MXFP8_TOPKS = _DECODE_DSV4_TOPKS
 _DECODE_DSV3_2_TOPKS = frozenset({128, 512, 1024, 2048})
 _DECODE_GLM53_NOPE_TOPK = 2176
 _DECODE_DOTS3_SWA_TOPK = 576
@@ -185,6 +191,7 @@ _CALIBRATION_HEADS = (8, 16, 32, 64, 128)
 _DECODE_DSV4_CALIBRATION_GRID = frozenset(
     (h, k) for h in _CALIBRATION_HEADS for k in _DECODE_DSV4_TOPKS
 )
+_DECODE_DSV4_MXFP8_CALIBRATION_GRID = _DECODE_DSV4_CALIBRATION_GRID
 _DECODE_DSV3_2_CALIBRATION_GRID = frozenset(
     (h, k) for h in _CALIBRATION_HEADS for k in _DECODE_DSV3_2_TOPKS
 )
@@ -288,6 +295,8 @@ def decode_splitk_eligible(
     if model_type == _MODEL_TYPE_DSV4:
         # The decode-dsv4 kernel takes the secondary cache as runtime args.
         return (num_heads, topk) in _DECODE_DSV4_DISPATCH
+    if model_type == _MODEL_TYPE_DSV4_MXFP8:
+        return (num_heads, topk) in _DECODE_DSV4_MXFP8_DISPATCH
     if model_type == _MODEL_TYPE_GLM53_NOPE:
         # decode-v32 has no dual-cache form.
         return not has_extra and (num_heads, topk) in _DECODE_GLM53_NOPE_DISPATCH
@@ -347,7 +356,7 @@ def prefill_mg_eligible(
         return False
     if model_type in _V32_MODEL_TYPES:
         return num_heads in _MG_V32_HEADS
-    if model_type == _MODEL_TYPE_DSV4:
+    if model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DSV4_MXFP8):
         return num_heads in _PREFILL_DSV4_HEADS
     return False
 
@@ -356,7 +365,7 @@ def prefill_mg_dual_eligible(
     model_type: int, num_heads: int, topk: int, page_block_size: int, has_extra: bool
 ) -> bool:
     return (
-        model_type == _MODEL_TYPE_DSV4
+        model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DSV4_MXFP8)
         and has_extra
         and page_block_size == _PAGE_BLOCK_SIZE
         and _prefill_topk_ok(topk)
@@ -466,6 +475,7 @@ def _resolve_cpb(
     num_heads: int,
     topk: int,
     extra_topk: int,
+    extra_page_block_size: int = 0,
 ) -> int:
     """Model-picked chunks_per_block; -1 selects the C++ heuristic fallback."""
     cpb_family = _CPB_FAMILY_ALIAS.get(family, family)
@@ -521,6 +531,60 @@ def _resolve_cpb(
             _cpb.mark_crossover_failed(device, family)
         else:
             _cpb.save_crossover(device, table)
+    if (
+        c is not None
+        and extra_topk > 0
+        and extra_page_block_size > 0
+        and family in ("dsv4", "dsv4_mxfp8")
+        and tuning
+        and not skipped
+        and not torch.cuda.is_current_stream_capturing()
+        and _cpb.get_decode_max_tokens(
+            device,
+            family,
+            num_heads,
+            topk,
+            extra_topk,
+            extra_page_block_size,
+        )
+        is None
+    ):
+        # Full-grid crossover calibration is intentionally single-cache.
+        # Warm the exact production dual-cache geometry on first use instead;
+        # the cache key includes both secondary top-k and page size.
+        failure_key = (
+            f"{family}:dual:{num_heads}:{topk}:{extra_topk}:{extra_page_block_size}"
+        )
+        if not _cpb.is_crossover_failed(device, failure_key):
+            from ._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+
+            try:
+                table = _cpb.calibrate_dual_crossover(
+                    _get_sparse_mla_sm120_decode_module(),
+                    device,
+                    family,
+                    c,
+                    [(num_heads, topk, extra_topk, extra_page_block_size)],
+                )
+            except (
+                CalibrationError,
+                torch.cuda.OutOfMemoryError,
+                RuntimeError,
+            ) as e:
+                logger.warning(
+                    "SM120 sparse-MLA %s dual-cache crossover calibration "
+                    "failed for H=%d main_topk=%d extra_topk=%d extra_page=%d "
+                    "(%s); keeping decode-first routing.",
+                    family,
+                    num_heads,
+                    topk,
+                    extra_topk,
+                    extra_page_block_size,
+                    e,
+                )
+                _cpb.mark_crossover_failed(device, failure_key)
+            else:
+                _cpb.save_crossover(device, table)
     if c is None:
         return -1
     hot_key = (
@@ -530,11 +594,25 @@ def _resolve_cpb(
         num_heads,
         topk,
         extra_topk,
+        extra_page_block_size,
         _cpb._constants_version,
     )
     cpb = _cpb_hot_cache.get(hot_key)
     if cpb is None:
-        cpb = _cpb.get_cpb_override(device, cpb_family, num_heads, topk, num_tokens)
+        if extra_topk > 0:
+            cpb = _cpb.get_cpb_override(
+                device,
+                cpb_family,
+                num_heads,
+                topk,
+                num_tokens,
+                extra_topk,
+                extra_page_block_size,
+            )
+        else:
+            # Keep the legacy call shape for the unchanged single-cache path
+            # (and for framework/tests that wrap this internal hook).
+            cpb = _cpb.get_cpb_override(device, cpb_family, num_heads, topk, num_tokens)
         if (
             cpb is None
             and tuning
@@ -608,12 +686,13 @@ def plan(
     device: torch.device,
     *,
     extra_topk: int = 0,
+    extra_page_block_size: int = 0,
 ) -> Optional[PlannedCall]:
     """Route one call to a kernel variant; None when no envelope serves it.
 
     Policy: a decode-instantiated decode-form call takes DECODE_SPLITK up to
     the calibrated ``decode_max_tokens`` crossover for
-    ``(model_type, num_heads, topk)`` (decode-first when uncalibrated);
+    the exact cache geometry (decode-first when uncalibrated);
     everything else takes the prefill variant from :func:`prefill_variant`.
     A forced swapab preference raises ValueError on ineligible shapes rather
     than returning None."""
@@ -624,6 +703,8 @@ def plan(
         topk,
         page_block_size,
         has_extra,
+        extra_topk,
+        extra_page_block_size,
         t_bucket,
         prefill_impl_pref,
         _cpb._device_key(device),
@@ -638,6 +719,8 @@ def plan(
             model_type,
             page_block_size,
             has_extra,
+            extra_topk,
+            extra_page_block_size,
             prefill_impl_pref,
             device,
         )
@@ -652,6 +735,7 @@ def plan(
             num_heads,
             topk,
             extra_topk,
+            extra_page_block_size,
         )
         return PlannedCall(variant, cpb)
     return PlannedCall(variant, -1)
@@ -664,15 +748,27 @@ def _decide(
     model_type: int,
     page_block_size: int,
     has_extra: bool,
+    extra_topk: int,
+    extra_page_block_size: int,
     prefill_impl_pref: int,
     device: torch.device,
 ) -> Optional[KernelVariant]:
     pf = prefill_variant(
         model_type, num_heads, topk, page_block_size, has_extra, prefill_impl_pref
     )
-    crossover = _cpb.get_decode_max_tokens(
-        device, _MODEL_TYPE_TO_FAMILY[model_type], num_heads, topk
-    )
+    family = _MODEL_TYPE_TO_FAMILY[model_type]
+    if extra_topk > 0:
+        crossover = _cpb.get_decode_max_tokens(
+            device,
+            family,
+            num_heads,
+            topk,
+            extra_topk,
+            extra_page_block_size,
+        )
+    else:
+        # Preserve the established single-cache lookup call and key schema.
+        crossover = _cpb.get_decode_max_tokens(device, family, num_heads, topk)
     return _select_calibrated_variant(
         decode_eligible=decode_splitk_eligible(
             model_type, num_heads, topk, page_block_size, has_extra, num_tokens

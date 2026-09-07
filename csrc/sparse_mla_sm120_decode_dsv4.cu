@@ -31,6 +31,7 @@ static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, cons
                                     size_t stride_out_lse, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT>;
+  using CT = ComputeTraits<MT, ComputeMode::FP8, Cfg::BI, Cfg::N_WARPS>;
   // Ceiling div so NUM_HEADS < HPB (small-TP configs, e.g. h=8) still get a
   // tile. NUM_HEADS == 0 is the runtime-head-count instantiation: num_heads
   // (<= 128) is taken from the argument, and the mid scratch is HPB-aligned
@@ -62,7 +63,8 @@ static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, cons
   //
   // DOTS3_SWA leaves ~4.2 KB spare. BI=64 for it needs 173872 B and the driver
   // rejects the opt-in outright. Both configs run 1 block/SM.
-  constexpr int N_V_CHUNKS_LAUNCH = KV::D_NOPE / KV::QUANT_TILE;  // DSV4 7, DOTS3_SWA 8
+  constexpr int N_V_CHUNKS_LAUNCH = CT::N_V_CHUNKS;  // DSV4 formats 7, DOTS3_SWA 8
+  constexpr int PV_SCALE_GROUPS = CT::SCALE_GROUPS_PER_V_CHUNK;
   constexpr int DYN_SMEM_BYTES =
       HPB * KV::D_ROPE * (int)sizeof(bf16)                            // sm_q_rope
       + HPB * KV::Q_NOPE_STRIDE                                       // sm_q_fp8
@@ -74,7 +76,8 @@ static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, cons
       + 4 * (int)sizeof(uint64_t)                                     // mbar_full+empty
       + 2 * Cfg::N_WARPS * HPB * (int)sizeof(float)                   // sm_reduce
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                  // sm_w_head_sc
-      + 2 * HPB * (Cfg::BI + 16);                                     // sm_w_fp8 ×2 (vc parity)
+      + 2 * PV_SCALE_GROUPS * HPB *
+            (Cfg::BI + 16);  // sm_w_fp8 ×2 (vc parity), one matrix/scale group
 
   auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(
@@ -165,7 +168,9 @@ bool launch_sparse_mla_decode_dsv4(
     int extra_topk, int pbs_extra, size_t stride_extra_kv_block, int chunks_per_block_override,
     float sm_scale, size_t stride_kv_block, size_t stride_indices_token,
     size_t stride_extra_indices_token, size_t stride_out_lse, cudaStream_t stream) {
-  if (mt != ModelType::DSV4 && mt != ModelType::DOTS3_SWA) return false;
+  if (mt != ModelType::DSV4 && mt != ModelType::DSV4_MXFP8 && mt != ModelType::DOTS3_SWA) {
+    return false;
+  }
   // DOTS3_SWA has no dual-cache instantiation; the planner never routes one
   // here, and the launcher rejects it so a direct FFI caller cannot silently
   // run an untested path.
@@ -207,6 +212,16 @@ bool launch_sparse_mla_decode_dsv4(
   DSV4_DISPATCH(128)
   DECODE_DISPATCH_RT(ModelType::DSV4)
 #undef DSV4_DISPATCH
+  // DSV4 MXFP8 uses the same sparse schedule and MMA family as DSV4, with
+  // per-32 UE8M0 scales and a 16-byte footer slot.
+#define DSV4_MXFP8_DISPATCH(H) DECODE_DISPATCH(ModelType::DSV4_MXFP8, (H))
+  DSV4_MXFP8_DISPATCH(8)
+  DSV4_MXFP8_DISPATCH(16)
+  DSV4_MXFP8_DISPATCH(32)
+  DSV4_MXFP8_DISPATCH(64)
+  DSV4_MXFP8_DISPATCH(128)
+  DECODE_DISPATCH_RT(ModelType::DSV4_MXFP8)
+#undef DSV4_MXFP8_DISPATCH
   // DOTS3_SWA sliding-window decode: a 513-token window carried as an index
   // set. topk is the buffer width (must be >= 513, checked above); the window
   // itself is clamped inside the kernel (DecodeTileCfg<DOTS3_SWA>::WINDOW), so

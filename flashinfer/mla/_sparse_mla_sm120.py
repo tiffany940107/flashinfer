@@ -94,6 +94,7 @@ from ._sparse_mla_sm120_plan import (
     _BI,
     _BPT_DSV3_2,
     _BPT_DSV4,
+    _BPT_DSV4_MXFP8,
     _BPT_DOTS3_SWA,
     _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DSV4_DISPATCH,  # noqa: F401  (vLLM probe surface)
@@ -101,10 +102,12 @@ from ._sparse_mla_sm120_plan import (
     _DECODE_MAX_TOKENS,
     _DECODE_DSV3_2_TOPKS,
     _DECODE_DSV4_TOPKS,
+    _DECODE_DSV4_MXFP8_TOPKS,
     _DECODE_DOTS3_SWA_DISPATCH,  # noqa: F401  (vLLM probe surface)
     _DECODE_DOTS3_SWA_TOPK,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
+    _MODEL_TYPE_DSV4_MXFP8,
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_GLM_NSA,
     _MODEL_TYPE_DOTS3_SWA,
@@ -133,7 +136,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
-_KV_CACHE_FORMATS = frozenset({"fp8", "nvfp4"})
+_KV_CACHE_FORMATS = frozenset({"fp8", "mxfp8", "nvfp4"})
 
 # Page block size the decode kernels are instantiated for (same constant for
 # both families; every instantiated kernel is pbs=64).
@@ -173,8 +176,8 @@ class SparseMLASm120DecodeConfig:
     max_num_heads : int
         Upper bound of the head-count envelope.
     kv_cache_format : str
-        Packed cache format described by this entry (``"fp8"`` or
-        ``"nvfp4"``).
+        Packed cache format described by this entry (``"fp8"``, ``"mxfp8"``,
+        or ``"nvfp4"``).
     bytes_per_token : int
         Logical packed-cache bytes per token.
     head_counts : Optional[frozenset[int]]
@@ -263,7 +266,7 @@ def supported_sparse_mla_sm120_configs(
 
     Parameters
     ----------
-    kv_cache_format : {"fp8", "nvfp4"}
+    kv_cache_format : {"fp8", "mxfp8", "nvfp4"}
         Storage format whose independently calibrated kernel envelope is
         requested. Defaults to ``"fp8"`` for backward compatibility.
 
@@ -272,7 +275,8 @@ def supported_sparse_mla_sm120_configs(
     dict[str, SparseMLASm120DecodeConfig]
         Mapping from kernel family to its instantiated decode set. FP8 returns
         DSv4, DSv3.2, GLM-NSA, GLM53_NOPE, and DOTS3_SWA entries. NVFP4
-        currently returns the independently calibrated DSv4 entry.
+        currently returns its independently calibrated DSv4 entry. MXFP8
+        returns the independently calibrated DSv4 E4M3 + UE8M0-g32 entry.
 
     Examples
     --------
@@ -285,10 +289,16 @@ def supported_sparse_mla_sm120_configs(
     ... )
     >>> nvfp4["dsv4"].bytes_per_token
     384
+    >>> mxfp8 = flashinfer.mla.supported_sparse_mla_sm120_configs(
+    ...     kv_cache_format="mxfp8"
+    ... )
+    >>> mxfp8["dsv4"].bytes_per_token
+    592
     """
     if kv_cache_format not in _KV_CACHE_FORMATS:
         raise ValueError(
-            f"kv_cache_format must be either 'fp8' or 'nvfp4', got {kv_cache_format!r}"
+            "kv_cache_format must be one of 'fp8', 'mxfp8', or 'nvfp4', "
+            f"got {kv_cache_format!r}"
         )
     if kv_cache_format == "nvfp4":
         return {
@@ -303,6 +313,20 @@ def supported_sparse_mla_sm120_configs(
                 bytes_per_token=384,
                 head_counts=frozenset({16, 32, 64, 128}),
                 topk_is_runtime=False,
+                extra_page_block_sizes=frozenset({2, 64}),
+            )
+        }
+    if kv_cache_format == "mxfp8":
+        return {
+            "dsv4": SparseMLASm120DecodeConfig(
+                d_qk=512,
+                page_block_size=_DECODE_DSV4_PAGE_BLOCK_SIZE,
+                max_num_tokens=_DECODE_MAX_TOKENS,
+                topks=_DECODE_DSV4_MXFP8_TOPKS,
+                min_topk=1,
+                max_num_heads=_DECODE_MAX_HEADS,
+                kv_cache_format="mxfp8",
+                bytes_per_token=_BPT_DSV4_MXFP8,
                 extra_page_block_sizes=frozenset({2, 64}),
             )
         }
@@ -361,7 +385,10 @@ def _decode_dispatch_error_message(
 ) -> str:
     """Build the decode dispatch-miss error, naming the mismatched parameter."""
     family = _MODEL_TYPE_TO_FAMILY[model_type]
-    config = supported_sparse_mla_sm120_configs()[family]
+    if model_type == _MODEL_TYPE_DSV4_MXFP8:
+        config = supported_sparse_mla_sm120_configs(kv_cache_format="mxfp8")["dsv4"]
+    else:
+        config = supported_sparse_mla_sm120_configs()[family]
     reasons = []
     if d_qk != config.d_qk:
         reasons.append(
@@ -502,11 +529,35 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
     )
 
 
+def _resolve_model_type_for_cache(
+    d_qk: int, kv_scale_format: str, kv_cache_format: str
+) -> int:
+    """Resolve native sparse-MLA policy from model and cache semantics."""
+    if kv_cache_format == "mxfp8":
+        if d_qk != 512:
+            raise ValueError(
+                f"kv_cache_format='mxfp8' requires DSV4 d_qk=512, got d_qk={d_qk}"
+            )
+        if _normalize_kv_scale_format(kv_scale_format) != "auto":
+            raise ValueError(
+                "kv_scale_format must remain 'auto' when kv_cache_format='mxfp8'"
+            )
+        return _MODEL_TYPE_DSV4_MXFP8
+    if kv_cache_format != "fp8":
+        raise ValueError(
+            "native sparse MLA requires kv_cache_format='fp8' or 'mxfp8', "
+            f"got {kv_cache_format!r}"
+        )
+    return _resolve_model_type(d_qk, kv_scale_format)
+
+
 def _bytes_per_token_for_model_type(model_type: int) -> int:
     if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE):
         return _BPT_DSV3_2
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
+    if model_type == _MODEL_TYPE_DSV4_MXFP8:
+        return _BPT_DSV4_MXFP8
     if model_type == _MODEL_TYPE_DOTS3_SWA:
         return _BPT_DOTS3_SWA
     raise ValueError(f"Unsupported SM120 sparse-MLA model_type={model_type}")
@@ -669,6 +720,15 @@ def get_sparse_mla_sm120_module():
                 "(sparse_mla_sm120_decode_dsv3_2)"
             )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
+        extra_pbs = (
+            _packed_kv_page_block_size(
+                extra_kv_cache,
+                model_type=model_type,
+                name="extra_kv_cache",
+            )
+            if extra_kv_cache is not None
+            else 0
+        )
         planned = plan(
             num_tokens,
             num_heads,
@@ -679,6 +739,7 @@ def get_sparse_mla_sm120_module():
             prefill_impl,
             q.device,
             extra_topk=extra_topk,
+            extra_page_block_size=extra_pbs,
         )
         if planned is None:
             # Neither the decode instantiations nor the prefill envelope
@@ -695,7 +756,11 @@ def get_sparse_mla_sm120_module():
                 )
             )
         if planned.variant is KernelVariant.DECODE_SPLITK:
-            if model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DOTS3_SWA):
+            if model_type in (
+                _MODEL_TYPE_DSV4,
+                _MODEL_TYPE_DSV4_MXFP8,
+                _MODEL_TYPE_DOTS3_SWA,
+            ):
                 num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
                 mid_out_view, mid_lse_view = _decode_scratch_views(
                     mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
@@ -717,6 +782,9 @@ def get_sparse_mla_sm120_module():
                     extra_kv_cache=extra_kv_cache,
                     extra_indices=extra_indices,
                     extra_topk_length=extra_topk_length,
+                    kv_cache_format=(
+                        "mxfp8" if model_type == _MODEL_TYPE_DSV4_MXFP8 else "fp8"
+                    ),
                     chunks_per_block=planned.cpb,
                 )
                 return
@@ -761,7 +829,142 @@ def get_sparse_mla_sm120_module():
     def _fake_paged_attention(*_args, **_kwargs) -> None:
         return None
 
-    return SimpleNamespace(paged_attention=_paged_attention)
+    @register_custom_op(
+        "flashinfer::sparse_mla_sm120_mxfp8_quantize_pack",
+        mutates_args=("cache",),
+    )
+    def _mxfp8_quantize_pack(latent_kv: torch.Tensor, cache: torch.Tensor) -> None:
+        module.sparse_mla_sm120_mxfp8_quantize_pack(latent_kv, cache)
+
+    @register_fake_op("flashinfer::sparse_mla_sm120_mxfp8_quantize_pack")
+    def _fake_mxfp8_quantize_pack(*_args, **_kwargs) -> None:
+        return None
+
+    @register_custom_op(
+        "flashinfer::sparse_mla_sm120_mxfp8_quantize_append",
+        mutates_args=("cache",),
+    )
+    def _mxfp8_quantize_append(
+        latent_kv: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        cache: torch.Tensor,
+    ) -> None:
+        module.sparse_mla_sm120_mxfp8_quantize_append(latent_kv, slot_mapping, cache)
+
+    @register_fake_op("flashinfer::sparse_mla_sm120_mxfp8_quantize_append")
+    def _fake_mxfp8_quantize_append(*_args, **_kwargs) -> None:
+        return None
+
+    return SimpleNamespace(
+        paged_attention=_paged_attention,
+        mxfp8_quantize_pack=_mxfp8_quantize_pack,
+        mxfp8_quantize_append=_mxfp8_quantize_append,
+    )
+
+
+def _check_mxfp8_latent_kv(
+    latent_kv: torch.Tensor, expected_rows: Optional[int]
+) -> None:
+    if not latent_kv.is_cuda:
+        raise ValueError(f"latent_kv must be a CUDA tensor, got {latent_kv.device}")
+    if latent_kv.dtype != torch.bfloat16:
+        raise ValueError(
+            f"latent_kv must have dtype torch.bfloat16, got {latent_kv.dtype}"
+        )
+    if latent_kv.ndim < 2 or latent_kv.ndim > 4 or latent_kv.shape[-1] != 512:
+        raise ValueError(
+            "latent_kv must be 2D, 3D, or 4D with last dimension 512, "
+            f"got shape {tuple(latent_kv.shape)}"
+        )
+    if not latent_kv.is_contiguous():
+        raise ValueError("latent_kv must be contiguous")
+    rows = latent_kv.numel() // 512
+    if expected_rows is not None and rows != expected_rows:
+        raise ValueError(f"latent_kv contains {rows} rows, expected {expected_rows}")
+
+
+@supported_compute_capability([120, 121])
+@flashinfer_api
+def mxfp8_quantize_pack_sparse_mla_cache(
+    latent_kv: torch.Tensor,
+    *,
+    kv_layout: str = "HND",
+) -> torch.Tensor:
+    r"""Quantize complete DeepSeek-V4 latent-KV pages to MXFP8 g32.
+
+    The first 448 values of each BF16 row are quantized to E4M3 with one
+    UE8M0 scale per 32 values. The final 64 BF16 RoPE values are copied
+    bit-for-bit. The returned opaque paged cache stores 576 data bytes per
+    token followed by a page footer containing 16 scale/padding bytes per
+    token; its logical last dimension must not be treated as a contiguous
+    per-token record.
+    """
+    if kv_layout not in ("HND", "NHD"):
+        raise ValueError(f"kv_layout must be 'HND' or 'NHD', got {kv_layout!r}")
+    _check_mxfp8_latent_kv(latent_kv, expected_rows=None)
+    if latent_kv.ndim == 2:
+        raise ValueError("full-page pack requires shape [num_pages, page_size, 512]")
+    if latent_kv.ndim == 3:
+        num_pages, page_size = latent_kv.shape[:2]
+    elif latent_kv.shape[1] == 1:
+        num_pages, page_size = latent_kv.shape[0], latent_kv.shape[2]
+    elif latent_kv.shape[2] == 1:
+        num_pages, page_size = latent_kv.shape[0], latent_kv.shape[1]
+    else:
+        raise ValueError(
+            "4D latent_kv must have a singleton latent-head axis at dimension 1 or 2"
+        )
+    _check_mxfp8_latent_kv(latent_kv, expected_rows=int(num_pages) * int(page_size))
+    shape = (
+        (num_pages, 1, page_size, _BPT_DSV4_MXFP8)
+        if kv_layout == "HND"
+        else (num_pages, page_size, 1, _BPT_DSV4_MXFP8)
+    )
+    cache = torch.empty(shape, dtype=torch.uint8, device=latent_kv.device)
+    if int(num_pages) != 0 and int(page_size) != 0:
+        get_sparse_mla_sm120_module().mxfp8_quantize_pack(latent_kv, cache)
+    return cache
+
+
+@supported_compute_capability([120, 121])
+@flashinfer_api
+def mxfp8_quantize_append_sparse_mla_cache(
+    latent_kv: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    cache: torch.Tensor,
+) -> None:
+    r"""Quantize and append DeepSeek-V4 latent KV by physical cache slot.
+
+    ``slot_mapping[i]`` is ``page_id * page_size + entry_id``. Negative or
+    out-of-range entries are padding and are ignored. If a valid slot occurs
+    more than once, its first input row wins deterministically. ``cache`` is
+    the opaque MXFP8 g32 layout returned by
+    :func:`mxfp8_quantize_pack_sparse_mla_cache`; HND, NHD, 3D shorthand, and
+    page-strided views are accepted.
+    """
+    if not slot_mapping.is_cuda:
+        raise ValueError(
+            f"slot_mapping must be a CUDA tensor, got {slot_mapping.device}"
+        )
+    if slot_mapping.dtype not in (torch.int32, torch.int64):
+        raise ValueError(
+            "slot_mapping must have dtype torch.int32 or torch.int64, "
+            f"got {slot_mapping.dtype}"
+        )
+    if slot_mapping.ndim != 1 or not slot_mapping.is_contiguous():
+        raise ValueError("slot_mapping must be a contiguous 1D tensor")
+    if cache.dtype != torch.uint8 or not cache.is_cuda:
+        raise ValueError("cache must be a CUDA uint8 tensor")
+    if latent_kv.device != cache.device or slot_mapping.device != cache.device:
+        raise ValueError(
+            "latent_kv, slot_mapping, and cache must be on the same device"
+        )
+    _packed_kv_page_block_size(cache, model_type=_MODEL_TYPE_DSV4_MXFP8, name="cache")
+    _check_mxfp8_latent_kv(latent_kv, expected_rows=slot_mapping.numel())
+    if slot_mapping.numel() != 0:
+        get_sparse_mla_sm120_module().mxfp8_quantize_append(
+            latent_kv, slot_mapping, cache
+        )
 
 
 @supported_compute_capability([120, 121])
@@ -775,6 +978,7 @@ def _sparse_mla_sm120_paged_attention(
     *,
     d_v: int = _D_V,
     kv_scale_format: str = "auto",
+    kv_cache_format: str = "fp8",
     topk_length: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
     extra_kv_cache: Optional[torch.Tensor] = None,
@@ -831,8 +1035,11 @@ def _sparse_mla_sm120_paged_attention(
         width. ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32
         inline scales at ``d_qk=576``; ``"arbitrary_fp32"`` selects
         GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
-        GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
-        DSV4.
+        GLM53_NOPE at ``d_qk=512``).
+    kv_cache_format : {"fp8", "mxfp8"}
+        Native packed-cache format. ``"fp8"`` preserves the existing DSV4
+        g64 cache, while ``"mxfp8"`` selects the DSV4 E4M3 + UE8M0-g32
+        cache. NVFP4 dispatches through its dedicated internal operator.
     topk_length : Optional[torch.Tensor]
         Effective top-k length per query token, shape ``[num_tokens]``, dtype
         int32. Required for sliding-window MLA near sequence start; ``None``
@@ -877,7 +1084,9 @@ def _sparse_mla_sm120_paged_attention(
     -----
     Requires SM120a / SM121a (block-scaled MXFP8 MMA + cp.async.bulk TMA).
     """
-    model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
+    model_type = _resolve_model_type_for_cache(
+        q.shape[-1], kv_scale_format, kv_cache_format
+    )
     _require_d_v(d_v, model_type)
     _check_last_dim(output, "output", model_type)
     # The secondary cache is an all-or-nothing argument group: without this
@@ -939,8 +1148,8 @@ class _SparseMLAPagedAttentionRunner:
         GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
         GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
         DSV4.
-    kv_cache_format : {"fp8", "nvfp4"}
-        Packed cache format. Both formats reuse this wrapper and its ``run``
+    kv_cache_format : {"fp8", "mxfp8", "nvfp4"}
+        Packed cache format. All formats reuse this wrapper and its ``run``
         signature; each format keeps its own planner and internal kernels.
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.
@@ -974,16 +1183,18 @@ class _SparseMLAPagedAttentionRunner:
         self._kv_scale_format = _normalize_kv_scale_format(kv_scale_format)
         if kv_cache_format not in _KV_CACHE_FORMATS:
             raise ValueError(
-                "kv_cache_format must be either 'fp8' or 'nvfp4', got "
-                f"{kv_cache_format!r}"
+                "kv_cache_format must be one of 'fp8', 'mxfp8', or 'nvfp4', "
+                f"got {kv_cache_format!r}"
             )
-        if kv_cache_format == "nvfp4":
+        if kv_cache_format in ("mxfp8", "nvfp4"):
             if d_v != 512:
-                raise ValueError("NVFP4 sparse MLA requires d_v=512")
+                raise ValueError(
+                    f"{kv_cache_format.upper()} sparse MLA requires d_v=512"
+                )
             if self._kv_scale_format != "auto":
                 raise ValueError(
-                    "kv_scale_format applies to FP8 caches and must remain 'auto' "
-                    "when kv_cache_format='nvfp4'"
+                    "kv_scale_format must remain 'auto' when "
+                    f"kv_cache_format={kv_cache_format!r}"
                 )
         self._kv_cache_format = kv_cache_format
 
@@ -1119,7 +1330,7 @@ class _SparseMLAPagedAttentionRunner:
     ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         if (mid_out is None) != (mid_lse is None):
             raise ValueError("mid_out and mid_lse must be passed together")
-        if mid_out is not None and self._kv_cache_format == "fp8":
+        if mid_out is not None and self._kv_cache_format != "nvfp4":
             return mid_out, mid_lse
 
         num_tokens, num_heads, d_qk = q.shape
@@ -1140,7 +1351,18 @@ class _SparseMLAPagedAttentionRunner:
             num_splits = (topk + 63) // 64 + (extra_topk + 63) // 64
             scratch_heads = num_heads
         else:
-            model_type = _resolve_model_type(d_qk, self._kv_scale_format)
+            model_type = _resolve_model_type_for_cache(
+                d_qk, self._kv_scale_format, self._kv_cache_format
+            )
+            extra_pbs = (
+                _packed_kv_page_block_size(
+                    extra_kv_cache,
+                    model_type=model_type,
+                    name="extra_kv_cache",
+                )
+                if extra_kv_cache is not None
+                else 0
+            )
             # Route with the same memoized plan() the op makes; only a
             # decode-routed call consumes split-K scratch. A dispatch miss
             # (None) falls through so the op reports it.
@@ -1156,6 +1378,7 @@ class _SparseMLAPagedAttentionRunner:
                 _normalize_prefill_impl(prefill_impl),
                 q.device,
                 extra_topk=extra_topk,
+                extra_page_block_size=extra_pbs,
             )
             if planned is None or planned.variant is not KernelVariant.DECODE_SPLITK:
                 return None, None
@@ -1343,6 +1566,7 @@ class _SparseMLAPagedAttentionRunner:
             sm_scale,
             d_v=self._d_v,
             kv_scale_format=self._kv_scale_format,
+            kv_cache_format=self._kv_cache_format,
             topk_length=topk_length,
             attn_sink=attn_sink,
             extra_kv_cache=extra_kv_cache,
@@ -1482,6 +1706,7 @@ def sparse_mla_sm120_decode_dsv4(
     extra_kv_cache: Optional[torch.Tensor] = None,
     extra_indices: Optional[torch.Tensor] = None,
     extra_topk_length: Optional[torch.Tensor] = None,
+    kv_cache_format: str = "fp8",
     chunks_per_block: Optional[int] = None,
 ) -> torch.Tensor:
     r"""Sparse-MLA paged decode (DSv4 standalone kernel) on SM120.
@@ -1539,6 +1764,9 @@ def sparse_mla_sm120_decode_dsv4(
     extra_topk_length : Optional[torch.Tensor]
         Per-token effective top-k length for the secondary cache, ``[T]``
         int32.
+    kv_cache_format : {"fp8", "mxfp8"}
+        Packed cache format. ``"fp8"`` selects the existing DSV4 g64 cache,
+        while ``"mxfp8"`` selects the DSV4 E4M3 + UE8M0-g32 cache.
     chunks_per_block : Optional[int]
         Explicit override. If ``None``, the calibrated model picks a value when
         available, else the C++ heuristic is used.
@@ -1548,9 +1776,16 @@ def sparse_mla_sm120_decode_dsv4(
     output : torch.Tensor
         The mutated output tensor (for chaining).
     """
-    # d_qk resolves the model type: 512 -> DSV4 (d_v 512), 1088 -> DOTS3_SWA
-    # (d_v 1024). The FFI applies the same resolution.
-    model_type = _MODEL_TYPE_DOTS3_SWA if q.shape[-1] == 1088 else _MODEL_TYPE_DSV4
+    model_type = _resolve_model_type_for_cache(q.shape[-1], "auto", kv_cache_format)
+    if model_type not in (
+        _MODEL_TYPE_DSV4,
+        _MODEL_TYPE_DSV4_MXFP8,
+        _MODEL_TYPE_DOTS3_SWA,
+    ):
+        raise ValueError(
+            "sparse_mla_sm120_decode_dsv4 supports only DSV4, DSV4 MXFP8, "
+            f"or DOTS3_SWA; got family={_MODEL_TYPE_TO_FAMILY[model_type]!r}"
+        )
     _check_last_dim(output, "output", model_type)
     _check_last_dim(mid_out, "mid_out", model_type)
     if q.shape[0] == 0:
@@ -1572,6 +1807,15 @@ def sparse_mla_sm120_decode_dsv4(
             q.shape[1],
             topk,
             extra_topk,
+            (
+                _packed_kv_page_block_size(
+                    extra_kv_cache,
+                    model_type=model_type,
+                    name="extra_kv_cache",
+                )
+                if extra_kv_cache is not None
+                else 0
+            ),
         )
 
     module.sparse_mla_sm120_decode_dsv4(
@@ -1589,6 +1833,7 @@ def sparse_mla_sm120_decode_dsv4(
         extra_kv_cache,
         extra_indices,
         extra_topk_length,
+        model_type,
         cpb_override,
     )
     return output

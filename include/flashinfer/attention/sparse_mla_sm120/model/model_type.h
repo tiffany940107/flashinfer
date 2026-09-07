@@ -37,12 +37,14 @@
 //   GLM53_NOPE: d_nope=512, d_rope=0, arbitrary FP32 scale inline,
 //               656B/token (the final 128 bytes are reserved cache padding)
 //   DOTS3_SWA: d_nope=1024, d_rope=64, UE8M0 scale footer, 1160B/token
+//   DSV4_MXFP8: DSV4 dimensions, E4M3 + one UE8M0 scale per 32 NoPE
+//                elements, 592B/token
 //
 // DOTS3_SWA is the sliding-window family: its candidate list is a 513-token
 // positional window rather than a genuine top-k. It is the first model whose
 // d_v diverges from 512 (it is 1024), so it opts out of the shared D_V assert
 // in kv_cache_traits.cuh.
-enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA };
+enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE, DOTS3_SWA, DSV4_MXFP8 };
 
 // Bytes per packed KV cache token row, per model type.
 constexpr int bytes_per_token(ModelType mt) {
@@ -53,6 +55,8 @@ constexpr int bytes_per_token(ModelType mt) {
       return 656;
     case ModelType::DSV4:
       return 584;
+    case ModelType::DSV4_MXFP8:
+      return 592;
     case ModelType::DOTS3_SWA:
       return 1160;
   }

@@ -388,16 +388,18 @@ inline bool dispatch_dots3_swa_sg(int num_heads, int topk, int page_block_size, 
 #undef DISPATCH_DOTS3_SWA_SG
 }
 
+template <ModelType MT>
 inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, const bf16* Q,
                                  const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t stride_out_lse,
                                  const int* topk_length_ptr, cudaStream_t stream) {
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DSV4_MXFP8);
   if (page_block_size != 64) return false;
-#define DISPATCH_MG_CM(CM, NH, NHG)                                                            \
-  launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, 64, NHG>(                            \
-      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, topk, stride_kv_block, \
-      stride_out_lse, topk_length_ptr, stream)
+#define DISPATCH_MG_CM(CM, NH, NHG)                                                                \
+  launch_prefill_mg<MT, ComputeMode::CM, NH, 64, NHG>(Q, KV, indices, attn_sink, output, out_lse,  \
+                                                      sm_scale, num_tokens, topk, stride_kv_block, \
+                                                      stride_out_lse, topk_length_ptr, stream)
 
 // NH=8 and NH=16 share the MG_N_HG_T=1 kernel. NH=8 zero-pads the upper half
 // of the 16-head tile and gates all global Q/sink/output/LSE accesses.
@@ -424,18 +426,24 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, c
     }                               \
   } while (0)
 
-  // Small K-loop: BF16 QK skips the FP8 Q-quantize prologue. Larger K
-  // amortises FP8's higher Tensor-Core throughput.
-  if (topk <= 256)
-    DISPATCH_BY_NH_CM(BF16);
-  else
+  // Standard DSV4 keeps its calibrated BF16/FP8 QK crossover. MXFP8 uses FP8
+  // QK for every shape: its two g32 P*V scale groups need the shared-memory
+  // otherwise consumed by the two-head-group BF16 Q staging area.
+  if constexpr (MT == ModelType::DSV4_MXFP8) {
     DISPATCH_BY_NH_CM(FP8);
+  } else {
+    if (topk <= 256)
+      DISPATCH_BY_NH_CM(BF16);
+    else
+      DISPATCH_BY_NH_CM(FP8);
+  }
 
 #undef DISPATCH_BY_NH_CM
 #undef DISPATCH_MG_CM
   return false;  // unreachable
 }
 
+template <ModelType MT>
 inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page_block_size,
                                int extra_page_block_size, const bf16* Q, const uint8_t* KV,
                                const int32_t* indices, const uint8_t* KV_extra,
@@ -444,11 +452,13 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page
                                size_t stride_kv_block, size_t stride_kv_block_extra,
                                size_t stride_out_lse, const int* topk_length_ptr,
                                const int* topk_length_extra_ptr, cudaStream_t stream) {
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DSV4_MXFP8);
   if (page_block_size != 64) return false;
-  if (topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr && topk_extra % BI == 0 &&
-      (extra_page_block_size == 64 || extra_page_block_size == 2)) {
+  if constexpr (MT == ModelType::DSV4) {
+    if (topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr && topk_extra % BI == 0 &&
+        (extra_page_block_size == 64 || extra_page_block_size == 2)) {
 #define DISPATCH_DUAL_MG_FULLTILE(NH, PBSX, NHG)                                                   \
-  launch_prefill_mg_dual_fulltile<ModelType::DSV4, NH, 64, PBSX, NHG>(                             \
+  launch_prefill_mg_dual_fulltile<MT, NH, 64, PBSX, NHG>(                                          \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, topk, \
       topk_extra, stride_kv_block, stride_kv_block_extra, stride_out_lse, stream)
 
@@ -475,51 +485,58 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page
     }                                            \
   } while (0)
 
-    if (extra_page_block_size == 64) {
-      DISPATCH_FULLTILE_BY_NH_PBSX(64);
-    } else {
-      DISPATCH_FULLTILE_BY_NH_PBSX(2);
-    }
+      if (extra_page_block_size == 64) {
+        DISPATCH_FULLTILE_BY_NH_PBSX(64);
+      } else {
+        DISPATCH_FULLTILE_BY_NH_PBSX(2);
+      }
 #undef DISPATCH_FULLTILE_BY_NH_PBSX
 #undef DISPATCH_DUAL_MG_FULLTILE
+    }
   }
 
 // topk and topk_extra are runtime; extra_page_block_size stays template
 // because it changes the KV stride. NH=8/16 use MG_N_HG_T=1; NH=8 is padded
 // internally.
 #define DISPATCH_DUAL_MG_CM(CM, NH, PBSX, NHG)                                                     \
-  launch_prefill_mg_dual<ModelType::DSV4, ComputeMode::CM, NH, 64, PBSX, NHG>(                     \
+  launch_prefill_mg_dual<MT, ComputeMode::CM, NH, 64, PBSX, NHG>(                                  \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, topk, \
       topk_extra, stride_kv_block, stride_kv_block_extra, stride_out_lse, topk_length_ptr,         \
       topk_length_extra_ptr, stream)
 
-#define DISPATCH_BY_NH_PBSX(PBSX)                \
-  do {                                           \
-    switch (num_heads) {                         \
-      case 8:                                    \
-        DISPATCH_DUAL_MG_CM(BF16, 8, PBSX, 1);   \
-        return true;                             \
-      case 16:                                   \
-        DISPATCH_DUAL_MG_CM(BF16, 16, PBSX, 1);  \
-        return true;                             \
-      case 32:                                   \
-        DISPATCH_DUAL_MG_CM(BF16, 32, PBSX, 2);  \
-        return true;                             \
-      case 64:                                   \
-        DISPATCH_DUAL_MG_CM(BF16, 64, PBSX, 2);  \
-        return true;                             \
-      case 128:                                  \
-        DISPATCH_DUAL_MG_CM(BF16, 128, PBSX, 2); \
-        return true;                             \
-      default:                                   \
-        return false;                            \
-    }                                            \
+#define DISPATCH_BY_NH_PBSX(CM, PBSX)          \
+  do {                                         \
+    switch (num_heads) {                       \
+      case 8:                                  \
+        DISPATCH_DUAL_MG_CM(CM, 8, PBSX, 1);   \
+        return true;                           \
+      case 16:                                 \
+        DISPATCH_DUAL_MG_CM(CM, 16, PBSX, 1);  \
+        return true;                           \
+      case 32:                                 \
+        DISPATCH_DUAL_MG_CM(CM, 32, PBSX, 2);  \
+        return true;                           \
+      case 64:                                 \
+        DISPATCH_DUAL_MG_CM(CM, 64, PBSX, 2);  \
+        return true;                           \
+      case 128:                                \
+        DISPATCH_DUAL_MG_CM(CM, 128, PBSX, 2); \
+        return true;                           \
+      default:                                 \
+        return false;                          \
+    }                                          \
   } while (0)
 
   if (extra_page_block_size == 64) {
-    DISPATCH_BY_NH_PBSX(64);
+    if constexpr (MT == ModelType::DSV4_MXFP8)
+      DISPATCH_BY_NH_PBSX(FP8, 64);
+    else
+      DISPATCH_BY_NH_PBSX(BF16, 64);
   } else if (extra_page_block_size == 2) {
-    DISPATCH_BY_NH_PBSX(2);
+    if constexpr (MT == ModelType::DSV4_MXFP8)
+      DISPATCH_BY_NH_PBSX(FP8, 2);
+    else
+      DISPATCH_BY_NH_PBSX(BF16, 2);
   }
   return false;
 #undef DISPATCH_BY_NH_PBSX
@@ -581,19 +598,34 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
     case PrefillVariant::MG: {
       if (extra_KV_cache != nullptr) return false;
       if (mt == ModelType::DSV4) {
-        return dispatch_dsv4_single(num_heads, topk, page_block_size, Q, KV_cache, indices,
-                                    attn_sink, output, out_lse, sm_scale, num_tokens,
-                                    stride_kv_block, stride_out_lse, topk_length, stream);
+        return dispatch_dsv4_single<ModelType::DSV4>(
+            num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output, out_lse,
+            sm_scale, num_tokens, stride_kv_block, stride_out_lse, topk_length, stream);
+      }
+      if (mt == ModelType::DSV4_MXFP8) {
+        return dispatch_dsv4_single<ModelType::DSV4_MXFP8>(
+            num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output, out_lse,
+            sm_scale, num_tokens, stride_kv_block, stride_out_lse, topk_length, stream);
       }
       DISPATCH_V32(dispatch_v32_mg);
     }
     case PrefillVariant::MG_DUAL: {
-      if (mt != ModelType::DSV4 || extra_KV_cache == nullptr) return false;
-      return dispatch_dsv4_dual(num_heads, topk, topk_extra, page_block_size, extra_page_block_size,
-                                Q, KV_cache, indices, extra_KV_cache, extra_indices, attn_sink,
-                                output, out_lse, sm_scale, num_tokens, stride_kv_block,
-                                stride_kv_block_extra, stride_out_lse, topk_length,
-                                extra_topk_length, stream);
+      if (extra_KV_cache == nullptr) return false;
+      if (mt == ModelType::DSV4) {
+        return dispatch_dsv4_dual<ModelType::DSV4>(
+            num_heads, topk, topk_extra, page_block_size, extra_page_block_size, Q, KV_cache,
+            indices, extra_KV_cache, extra_indices, attn_sink, output, out_lse, sm_scale,
+            num_tokens, stride_kv_block, stride_kv_block_extra, stride_out_lse, topk_length,
+            extra_topk_length, stream);
+      }
+      if (mt == ModelType::DSV4_MXFP8) {
+        return dispatch_dsv4_dual<ModelType::DSV4_MXFP8>(
+            num_heads, topk, topk_extra, page_block_size, extra_page_block_size, Q, KV_cache,
+            indices, extra_KV_cache, extra_indices, attn_sink, output, out_lse, sm_scale,
+            num_tokens, stride_kv_block, stride_kv_block_extra, stride_out_lse, topk_length,
+            extra_topk_length, stream);
+      }
+      return false;
     }
   }
   return false;

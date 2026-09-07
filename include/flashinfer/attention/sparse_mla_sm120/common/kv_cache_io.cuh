@@ -141,11 +141,11 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
 
   constexpr int pbs = PAGE_BLOCK_SIZE;
   constexpr int SCALE_BYTES = KV::SCALE_BYTES_PER_TOKEN;
-  // Only reachable for footer-scale models (the inline ones return above), so
-  // the width check is disjoined rather than applied to every instantiation.
-  static_assert(KV::SCALE_IN_KV_SMEM || SCALE_BYTES == sizeof(uint64_t),
-                "the footer gather moves one uint64 per token; a different footer width needs a "
-                "different load");
+  // Footer slots are kept naturally aligned so the baseline g64 format moves
+  // one uint64 and MXFP8-g32 moves one uint4 per token.
+  static_assert(
+      KV::SCALE_IN_KV_SMEM || SCALE_BYTES == sizeof(uint64_t) || SCALE_BYTES == sizeof(uint4),
+      "footer scale slots must be 8 or 16 bytes");
   static_assert(TILE_BI <= TILE_IO_THREADS,
                 "per-thread index staging assumes at most one candidate per IO thread");
   if (io_tid >= TILE_BI) return;
@@ -156,6 +156,11 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, int idx,
   int local_idx = idx % pbs;
   const uint8_t* src = kv_ptr + (size_t)block_idx * stride_kv_block + (size_t)pbs * IO::IO_STRIDE +
                        (size_t)local_idx * SCALE_BYTES;
-  *reinterpret_cast<uint64_t*>(scale_dst + io_tid * SCALE_BYTES) =
-      __ldg(reinterpret_cast<const uint64_t*>(src));
+  if constexpr (SCALE_BYTES == sizeof(uint64_t)) {
+    *reinterpret_cast<uint64_t*>(scale_dst + io_tid * SCALE_BYTES) =
+        __ldg(reinterpret_cast<const uint64_t*>(src));
+  } else {
+    *reinterpret_cast<uint4*>(scale_dst + io_tid * SCALE_BYTES) =
+        __ldg(reinterpret_cast<const uint4*>(src));
+  }
 }

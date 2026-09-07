@@ -28,6 +28,8 @@ _SPARSE_MLA_SM120_LAZY_EXPORTS = frozenset(
         "SparseMLASm120DecodeConfig",
         "SparseMLASm120Wrapper",
         "calibrate_sparse_mla_sm120",
+        "mxfp8_quantize_append_sparse_mla_cache",
+        "mxfp8_quantize_pack_sparse_mla_cache",
         "supported_sparse_mla_sm120_configs",
     }
 )

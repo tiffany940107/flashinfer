@@ -86,13 +86,37 @@ _HPB = 16  # head tile per block
 _SCHEMA_VERSION = 1
 # Only current-schema files load; any other version counts as absent and the
 # families recalibrate on the next tuning-mode pass.
-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
-_D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
-_D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
+_BYTES_PER_TOKEN = {
+    "dsv4": 584,
+    "dsv4_mxfp8": 592,
+    "dsv3_2": 656,
+    "glm53_nope": 656,
+    "dots3_swa": 1160,
+}
+_D_QK = {
+    "dsv4": 512,
+    "dsv4_mxfp8": 512,
+    "dsv3_2": 576,
+    "glm53_nope": 512,
+    "dots3_swa": 1088,
+}
+_D_V = {
+    "dsv4": 512,
+    "dsv4_mxfp8": 512,
+    "dsv3_2": 512,
+    "glm53_nope": 512,
+    "dots3_swa": 1024,
+}
 # Kernel candidate-tile width per family: DOTS3_SWA decodes at BI=32 (its
 # 1040-byte KV smem stride does not fit BI=64); the others run 64. The head
 # tile is HPB=16 for every family.
-_CHUNK_WIDTH = {"dsv4": 64, "dsv3_2": 64, "glm53_nope": 64, "dots3_swa": 32}
+_CHUNK_WIDTH = {
+    "dsv4": 64,
+    "dsv4_mxfp8": 64,
+    "dsv3_2": 64,
+    "glm53_nope": 64,
+    "dots3_swa": 32,
+}
 
 # Device-level key in the JSON payload holding the crossover table.
 _DECODE_MAX_TOKENS_KEY = "decode_max_tokens"
@@ -100,6 +124,10 @@ _DECODE_MAX_TOKENS_KEY = "decode_max_tokens"
 _CPB_OVERRIDES_KEY = "cpb_overrides"
 # Probe grid and decode-wins margin for crossover calibration.
 _CROSSOVER_PROBED_T = (4, 8, 16, 24, 32, 48, 64)
+# Dual-cache DSV4 serving includes very small decode batches, so its targeted
+# calibration additionally probes T=1/2 without changing the existing
+# single-cache calibration grid (and therefore the default FP8 behavior).
+_DUAL_CROSSOVER_PROBED_T = (1, 2, *_CROSSOVER_PROBED_T)
 _CROSSOVER_MARGIN = 0.95
 # refine_cpb times the model pick +- this many cpb candidates and keeps the
 # measured best; the window covers every model-vs-oracle gap observed in the
@@ -320,28 +348,37 @@ def select_cpb(
     return capped_cpb or best_cpb
 
 
-def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, int]:
+def _allocate_kv_pool(
+    family: str,
+    device: torch.device,
+    *,
+    page_block_size: int = 64,
+    pool_bytes_target: int = _POOL_BYTES_TARGET,
+    pool_bytes_min: int = _POOL_BYTES_MIN,
+) -> tuple[torch.Tensor, int]:
     """Allocate a ~2 GiB paged KV pool for ``family`` (halved on OOM down to
     512 MiB) and return it with its slot count. The 2-D ``[blocks, bytes]``
-    form is accepted by the FFI binding, which derives the block stride from
-    the tensor metadata. The row is one 64-token page for every family — the
-    64 here is the page block size, not the family's chunk width (DOTS3_SWA
-    chunks 32 candidates per tile inside the same 64-token page)."""
-    w = 64 * _BYTES_PER_TOKEN[family]
-    pool_bytes = _POOL_BYTES_TARGET
+    form is accepted by the FFI binding, which derives the block stride and
+    page size from the tensor metadata. Single-cache calibration uses the
+    production 64-token page; dual-cache calibration also exercises the
+    compressed cache's actual page size."""
+    if page_block_size <= 0:
+        raise ValueError(f"page_block_size must be positive, got {page_block_size}")
+    w = page_block_size * _BYTES_PER_TOKEN[family]
+    pool_bytes = pool_bytes_target
     while True:
         try:
             kv_cache = torch.empty(pool_bytes // w, w, dtype=torch.uint8, device=device)
             break
         except torch.cuda.OutOfMemoryError:
-            if pool_bytes <= _POOL_BYTES_MIN:
+            if pool_bytes <= pool_bytes_min:
                 raise CalibrationError(
-                    f"cannot allocate a >= {_POOL_BYTES_MIN >> 20} MiB KV pool "
+                    f"cannot allocate a >= {pool_bytes_min >> 20} MiB KV pool "
                     "for sparse-MLA cpb calibration"
                 ) from None
             pool_bytes //= 2
             torch.cuda.empty_cache()
-    return kv_cache, kv_cache.shape[0] * 64
+    return kv_cache, kv_cache.shape[0] * page_block_size
 
 
 def calibration_batch_count(
@@ -429,6 +466,64 @@ def _time_call_fresh_indices(
     return time_calibration_calls(call, sets)
 
 
+def _time_call_fresh_dual_indices(
+    call: Callable[[torch.Tensor, torch.Tensor], None],
+    num_tokens: int,
+    topk: int,
+    extra_topk: int,
+    num_slots: int,
+    extra_num_slots: int,
+    device: torch.device,
+    bytes_per_token: int,
+) -> float:
+    """DRAM-faithful steady-state timing for a dual-cache call.
+
+    This is the two-index-set counterpart of :func:`_time_call_fresh_indices`.
+    Both cache streams rotate independently, and the reuse-distance budget is
+    derived from their combined gather footprint.
+    """
+    l2 = int(getattr(torch.cuda.get_device_properties(device), "L2_cache_size", 0) or 0)
+    footprint = max(1, num_tokens * (topk + extra_topk) * bytes_per_token)
+    k = (
+        _MIN_BATCH_CALLS
+        if not l2
+        else min(_MAX_BATCH_CALLS, max(_MIN_BATCH_CALLS, l2 // footprint + 2))
+    )
+    sets = [
+        (
+            torch.randint(
+                0,
+                num_slots,
+                (num_tokens, topk),
+                dtype=torch.int32,
+                device=device,
+            ),
+            torch.randint(
+                0,
+                extra_num_slots,
+                (num_tokens, extra_topk),
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+        for _ in range(k)
+    ]
+    for i in range(_WARMUP_ITERS):
+        call(*sets[i % k])
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    best = float("inf")
+    for _ in range(_TIMED_BATCHES):
+        start.record()
+        for indices, extra_indices in sets:
+            call(indices, extra_indices)
+        end.record()
+        torch.cuda.synchronize()
+        best = min(best, start.elapsed_time(end) / 1e3 / k)
+    return best
+
+
 def _make_decode_call_builder(
     module: Any, family: str, device: torch.device, kv_cache: torch.Tensor
 ) -> Callable[[int, int, int, int, int], Callable[[torch.Tensor], None]]:
@@ -437,9 +532,9 @@ def _make_decode_call_builder(
     Returns a builder mapping ``(num_tokens, num_heads, topk, model_type,
     cpb)`` to a ``call(indices) -> None`` closure that drives the family's
     decode kernel over ``kv_cache``, so the two calibration passes' FFI
-    argument lists cannot drift apart. ``model_type`` only reaches the
-    dsv3_2-kernel families; the decode-dsv4 FFI resolves the model type from
-    ``d_qk`` itself (512 -> DSV4, 1088 -> DOTS3_SWA).
+    argument lists cannot drift apart. ``model_type`` reaches both decode
+    entry points: the DSV4 entry uses it to distinguish the FP8-g64 and
+    MXFP8-g32 cache ABIs that share ``d_qk == 512``.
     """
     d_qk = _D_QK[family]
     d_v = _D_V[family]
@@ -480,7 +575,7 @@ def _make_decode_call_builder(
             num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
         )
         out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
-        if family in ("dsv4", "dots3_swa"):
+        if family in ("dsv4", "dsv4_mxfp8", "dots3_swa"):
 
             def call(indices: torch.Tensor) -> None:
                 module.sparse_mla_sm120_decode_dsv4(
@@ -498,6 +593,7 @@ def _make_decode_call_builder(
                     None,
                     None,
                     None,
+                    model_type,
                     cpb,
                 )
 
@@ -548,6 +644,9 @@ def calibrate(
         )
     from ._sparse_mla_sm120_plan import (
         _MODEL_TYPE_DSV3_2,
+        _MODEL_TYPE_DSV4,
+        _MODEL_TYPE_DSV4_MXFP8,
+        _MODEL_TYPE_DOTS3_SWA,
         _MODEL_TYPE_GLM53_NOPE,
     )
 
@@ -564,9 +663,12 @@ def calibrate(
         "dots3_swa": _MEASUREMENTS_DOTS3_SWA,
     }
     measurements = _CPB_PAIR_MEASUREMENTS.get(family, _MEASUREMENTS)
-    model_type = (
-        _MODEL_TYPE_GLM53_NOPE if family == "glm53_nope" else _MODEL_TYPE_DSV3_2
-    )
+    model_type = {
+        "dsv4": _MODEL_TYPE_DSV4,
+        "dsv4_mxfp8": _MODEL_TYPE_DSV4_MXFP8,
+        "glm53_nope": _MODEL_TYPE_GLM53_NOPE,
+        "dots3_swa": _MODEL_TYPE_DOTS3_SWA,
+    }.get(family, _MODEL_TYPE_DSV3_2)
 
     kv_cache, num_slots = _allocate_kv_pool(family, device)
 
@@ -711,11 +813,13 @@ def calibrate_crossover(
     from ._sparse_mla_sm120_plan import (
         _DECODE_DSV3_2_CALIBRATION_GRID,
         _DECODE_DSV4_CALIBRATION_GRID,
+        _DECODE_DSV4_MXFP8_CALIBRATION_GRID,
         _DECODE_GLM53_NOPE_CALIBRATION_GRID,
         _DECODE_DOTS3_SWA_CALIBRATION_GRID,
         _PREFILL_IMPL_AUTO,
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_DSV4,
+        _MODEL_TYPE_DSV4_MXFP8,
         _MODEL_TYPE_GLM_NSA,
         _MODEL_TYPE_GLM53_NOPE,
         _MODEL_TYPE_DOTS3_SWA,
@@ -736,6 +840,14 @@ def calibrate_crossover(
         # (key prefix, calibration grid, FFI model_type)
         spaces = [
             ("dsv4", grid or sorted(_DECODE_DSV4_CALIBRATION_GRID), _MODEL_TYPE_DSV4)
+        ]
+    elif family == "dsv4_mxfp8":
+        spaces = [
+            (
+                "dsv4_mxfp8",
+                grid or sorted(_DECODE_DSV4_MXFP8_CALIBRATION_GRID),
+                _MODEL_TYPE_DSV4_MXFP8,
+            )
         ]
     elif family == "dsv3_2":
         pairs = grid or sorted(_DECODE_DSV3_2_CALIBRATION_GRID)
@@ -848,6 +960,267 @@ def calibrate_crossover(
     return table
 
 
+def calibrate_dual_crossover(
+    module: Any,
+    device: torch.device,
+    family: str,
+    c: CpbConstants,
+    configs: list[tuple[int, int, int, int]],
+) -> dict[str, int]:
+    """Measure DSV4 dual-cache decode/prefill crossovers.
+
+    Each config is ``(num_heads, main_topk, extra_topk,
+    extra_page_block_size)``.  The production main cache uses page size 64;
+    the compressed cache is allocated with the exact requested page size.
+    FP8-g64 and MXFP8-g32 use separate ``family`` key spaces and therefore
+    never share a measured routing threshold.
+    """
+    from ._sparse_mla_sm120_plan import (
+        _MODEL_TYPE_DSV4,
+        _MODEL_TYPE_DSV4_MXFP8,
+        _PREFILL_IMPL_AUTO,
+        _decode_scratch_heads,
+        prefill_variant,
+    )
+
+    if family not in ("dsv4", "dsv4_mxfp8"):
+        raise ValueError(
+            "dual-cache crossover calibration supports only dsv4 and "
+            f"dsv4_mxfp8, got {family!r}"
+        )
+    if not configs:
+        return {}
+    if torch.cuda.is_current_stream_capturing():
+        raise CalibrationError(
+            "sparse-MLA SM120 dual-cache crossover calibration must not run "
+            "under CUDA graph capture"
+        )
+
+    device = torch.device(device)
+    d_qk = _D_QK[family]
+    d_v = _D_V[family]
+    bi = _CHUNK_WIDTH[family]
+    sm_scale = d_qk**-0.5
+    model_type = _MODEL_TYPE_DSV4_MXFP8 if family == "dsv4_mxfp8" else _MODEL_TYPE_DSV4
+
+    # Keep the total dual-cache calibration pool near the single-cache 2-GiB
+    # target.  Each half independently dwarfs L2, and both index streams
+    # rotate in _time_call_fresh_dual_indices.
+    half_target = max(_POOL_BYTES_MIN, _POOL_BYTES_TARGET // 2)
+    half_min = max(1 << 28, _POOL_BYTES_MIN // 2)
+    kv_cache, num_slots = _allocate_kv_pool(
+        family,
+        device,
+        pool_bytes_target=half_target,
+        pool_bytes_min=half_min,
+    )
+    extra_pools: dict[int, tuple[torch.Tensor, int]] = {}
+
+    def extra_pool(page_block_size: int) -> tuple[torch.Tensor, int]:
+        pool = extra_pools.get(page_block_size)
+        if pool is None:
+            pool = _allocate_kv_pool(
+                family,
+                device,
+                page_block_size=page_block_size,
+                pool_bytes_target=half_target,
+                pool_bytes_min=half_min,
+            )
+            extra_pools[page_block_size] = pool
+        return pool
+
+    def make_common(
+        num_tokens: int,
+        num_heads: int,
+        main_topk: int,
+        extra_topk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q = (
+            (
+                torch.randn(
+                    num_tokens,
+                    num_heads,
+                    d_qk,
+                    device=device,
+                    dtype=torch.float32,
+                )
+                / 10.0
+            )
+            .clamp(-1, 1)
+            .to(torch.bfloat16)
+        )
+        output = torch.empty(
+            num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
+        )
+        out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+        return q, output, out_lse
+
+    def time_decode(
+        num_tokens: int,
+        num_heads: int,
+        main_topk: int,
+        extra_topk: int,
+        extra_page_block_size: int,
+    ) -> float:
+        extra_kv_cache, extra_num_slots = extra_pool(extra_page_block_size)
+        cpb = select_cpb(
+            num_tokens,
+            num_heads,
+            main_topk,
+            extra_topk,
+            c,
+            chunk_width=bi,
+        )
+        num_splits = _ceil_div(main_topk, bi) + _ceil_div(extra_topk, bi)
+        q, output, out_lse = make_common(num_tokens, num_heads, main_topk, extra_topk)
+        scratch_heads = _decode_scratch_heads(num_heads)
+        mid_out = torch.empty(
+            num_tokens,
+            scratch_heads,
+            num_splits,
+            d_v,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        mid_lse = torch.empty(
+            num_tokens,
+            scratch_heads,
+            num_splits,
+            dtype=torch.float32,
+            device=device,
+        )
+
+        def call(indices: torch.Tensor, extra_indices: torch.Tensor) -> None:
+            module.sparse_mla_sm120_decode_dsv4(
+                q,
+                kv_cache,
+                indices,
+                mid_out,
+                mid_lse,
+                output,
+                out_lse,
+                num_splits,
+                sm_scale,
+                None,
+                None,
+                extra_kv_cache,
+                extra_indices,
+                None,
+                model_type,
+                cpb,
+            )
+
+        return _time_call_fresh_dual_indices(
+            call,
+            num_tokens,
+            main_topk,
+            extra_topk,
+            num_slots,
+            extra_num_slots,
+            device,
+            _BYTES_PER_TOKEN[family],
+        )
+
+    def time_prefill(
+        num_tokens: int,
+        num_heads: int,
+        main_topk: int,
+        extra_topk: int,
+        extra_page_block_size: int,
+    ) -> float:
+        variant = prefill_variant(
+            model_type,
+            num_heads,
+            main_topk,
+            64,
+            True,
+            _PREFILL_IMPL_AUTO,
+        )
+        if variant is None:
+            return float("inf")
+        extra_kv_cache, extra_num_slots = extra_pool(extra_page_block_size)
+        q, output, out_lse = make_common(num_tokens, num_heads, main_topk, extra_topk)
+
+        def call(indices: torch.Tensor, extra_indices: torch.Tensor) -> None:
+            module.sparse_mla_sm120_paged_attention(
+                q,
+                kv_cache,
+                indices,
+                output,
+                out_lse,
+                sm_scale,
+                model_type,
+                int(variant),
+                None,
+                None,
+                extra_kv_cache,
+                extra_indices,
+                None,
+            )
+
+        try:
+            call(
+                torch.randint(
+                    0,
+                    num_slots,
+                    (num_tokens, main_topk),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+                torch.randint(
+                    0,
+                    extra_num_slots,
+                    (num_tokens, extra_topk),
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            )
+            torch.cuda.synchronize()
+        except RuntimeError:
+            return float("inf")
+        return _time_call_fresh_dual_indices(
+            call,
+            num_tokens,
+            main_topk,
+            extra_topk,
+            num_slots,
+            extra_num_slots,
+            device,
+            _BYTES_PER_TOKEN[family],
+        )
+
+    table: dict[str, int] = {}
+    for num_heads, main_topk, extra_topk, extra_page_block_size in sorted(configs):
+        best = 0
+        for num_tokens in _DUAL_CROSSOVER_PROBED_T:
+            t_dec = time_decode(
+                num_tokens,
+                num_heads,
+                main_topk,
+                extra_topk,
+                extra_page_block_size,
+            )
+            t_pre = time_prefill(
+                num_tokens,
+                num_heads,
+                main_topk,
+                extra_topk,
+                extra_page_block_size,
+            )
+            if t_dec <= _CROSSOVER_MARGIN * t_pre:
+                best = num_tokens
+        table[
+            _crossover_key(
+                family,
+                num_heads,
+                main_topk,
+                extra_topk,
+                extra_page_block_size,
+            )
+        ] = best
+    return table
+
+
 def refine_cpb(
     module_getter: Callable[[], Any],
     family: str,
@@ -869,6 +1242,9 @@ def refine_cpb(
     """
     from ._sparse_mla_sm120_plan import (
         _MODEL_TYPE_DSV3_2,
+        _MODEL_TYPE_DSV4,
+        _MODEL_TYPE_DSV4_MXFP8,
+        _MODEL_TYPE_DOTS3_SWA,
         _MODEL_TYPE_GLM53_NOPE,
     )
 
@@ -884,9 +1260,12 @@ def refine_cpb(
     center = select_cpb(num_tokens, num_heads, topk, 0, c, chunk_width=bi)
     kv_cache, num_slots = _allocate_kv_pool(family, device)
     build_call = _make_decode_call_builder(module_getter(), family, device, kv_cache)
-    model_type = (
-        _MODEL_TYPE_GLM53_NOPE if family == "glm53_nope" else _MODEL_TYPE_DSV3_2
-    )
+    model_type = {
+        "dsv4": _MODEL_TYPE_DSV4,
+        "dsv4_mxfp8": _MODEL_TYPE_DSV4_MXFP8,
+        "glm53_nope": _MODEL_TYPE_GLM53_NOPE,
+        "dots3_swa": _MODEL_TYPE_DOTS3_SWA,
+    }.get(family, _MODEL_TYPE_DSV3_2)
     best_cpb, best_t = center, float("inf")
     lo = max(1, center - _REFINE_WINDOW)
     hi = min(n, center + _REFINE_WINDOW)
@@ -921,8 +1300,11 @@ _failed: set[tuple[str, str]] = set()
 # dev_key -> flat {"<family>|<num_heads>|<topk>": decode_max_tokens} table.
 _crossover: dict[str, dict[str, int]] = {}
 _crossover_failed: set[tuple[str, str]] = set()
-# dev_key -> flat {"<family>|<num_heads>|<topk>|<num_tokens>": cpb} table of
-# per-shape measured picks written by refine_cpb at tuning time.
+# dev_key -> flat per-shape measured cpb table written by refinement at tuning
+# time. Single-cache entries retain the schema-v1
+# ``family|heads|topk|tokens`` key. Dual-cache entries additionally carry
+# ``extra_topk|extra_page_block_size`` so they cannot alias single-cache or a
+# different compressed-cache geometry.
 _cpb_overrides: dict[str, dict[str, int]] = {}
 # Bumped whenever new constants enter the process (disk load or save), so
 # select_cpb memoization keyed on it never serves stale picks.
@@ -1116,11 +1498,40 @@ def save_crossover(device: torch.device, table: dict[str, int]) -> None:
     _crossover.setdefault(dev_key, {}).update(table)
 
 
+def _crossover_key(
+    family: str,
+    num_heads: int,
+    topk: int,
+    extra_topk: int = 0,
+    extra_page_block_size: int = 0,
+) -> str:
+    """Stable cache key for one decode/prefill crossover.
+
+    Preserve the schema-v1 three-field key for single-cache calls.  A dual
+    cache changes both kernels' memory-access geometry, so its measured
+    crossover is isolated by the secondary top-k and page size.  In
+    particular, a single-cache entry must never route a DSV4 main+compressed
+    cache call.
+    """
+    if extra_topk <= 0:
+        return f"{family}|{num_heads}|{topk}"
+    return f"{family}|{num_heads}|{topk}|{extra_topk}|{extra_page_block_size}"
+
+
 def get_decode_max_tokens(
-    device: torch.device, family: str, num_heads: int, topk: int
+    device: torch.device,
+    family: str,
+    num_heads: int,
+    topk: int,
+    extra_topk: int = 0,
+    extra_page_block_size: int = 0,
 ) -> Optional[int]:
-    """Calibrated crossover for one config; None when absent (default policy:
-    decode-form calls always take the decode kernel)."""
+    """Calibrated crossover for one cache geometry.
+
+    Returns ``None`` when the exact geometry is absent, preserving the
+    decode-first fallback.  Single-cache keys remain backward compatible;
+    dual-cache lookups never fall back to a single-cache entry.
+    """
     dev_key = _device_key(device)
     table = _crossover.get(dev_key)
     if table is None:
@@ -1128,7 +1539,15 @@ def get_decode_max_tokens(
         table = _crossover.get(dev_key)
     if table is None:
         return None
-    return table.get(f"{family}|{num_heads}|{topk}")
+    return table.get(
+        _crossover_key(
+            family,
+            num_heads,
+            topk,
+            extra_topk,
+            extra_page_block_size,
+        )
+    )
 
 
 def has_crossover(device: torch.device, family: str) -> bool:
@@ -1156,12 +1575,14 @@ def crossover_grid_complete(device: torch.device, family: str) -> bool:
     from ._sparse_mla_sm120_plan import (
         _DECODE_DSV3_2_CALIBRATION_GRID,
         _DECODE_DSV4_CALIBRATION_GRID,
+        _DECODE_DSV4_MXFP8_CALIBRATION_GRID,
         _DECODE_GLM53_NOPE_CALIBRATION_GRID,
         _DECODE_DOTS3_SWA_CALIBRATION_GRID,
     )
 
     key_spaces = {
         "dsv4": (("dsv4", _DECODE_DSV4_CALIBRATION_GRID),),
+        "dsv4_mxfp8": (("dsv4_mxfp8", _DECODE_DSV4_MXFP8_CALIBRATION_GRID),),
         "dsv3_2": (
             ("dsv3_2", _DECODE_DSV3_2_CALIBRATION_GRID),
             ("glm_nsa", _DECODE_DSV3_2_CALIBRATION_GRID),
@@ -1193,11 +1614,42 @@ def is_crossover_failed(device: torch.device, family: str) -> bool:
     return (_device_key(device), family) in _crossover_failed
 
 
+def _cpb_override_key(
+    family: str,
+    num_heads: int,
+    topk: int,
+    num_tokens: int,
+    extra_topk: int = 0,
+    extra_page_block_size: int = 0,
+) -> str:
+    """Stable key for one measured CPB tactic.
+
+    Preserve the schema-v1 four-field key for single-cache calls. A
+    dual-cache tactic depends on both the secondary list width and its page
+    geometry, so an exact dual lookup must never fall back to the legacy
+    single-cache entry.
+    """
+    key = f"{family}|{num_heads}|{topk}|{num_tokens}"
+    if extra_topk > 0:
+        key += f"|{extra_topk}|{extra_page_block_size}"
+    return key
+
+
 def get_cpb_override(
-    device: torch.device, family: str, num_heads: int, topk: int, num_tokens: int
+    device: torch.device,
+    family: str,
+    num_heads: int,
+    topk: int,
+    num_tokens: int,
+    extra_topk: int = 0,
+    extra_page_block_size: int = 0,
 ) -> Optional[int]:
-    """Measured per-shape cpb from :func:`refine_cpb`; None when absent (the
-    analytical model's pick governs)."""
+    """Measured per-shape CPB for the exact cache geometry.
+
+    Returns ``None`` when absent so the analytical model governs. Legacy
+    single-cache entries remain readable; dual-cache lookups do not alias
+    them or a different secondary page size.
+    """
     dev_key = _device_key(device)
     table = _cpb_overrides.get(dev_key)
     if table is None:
@@ -1205,7 +1657,16 @@ def get_cpb_override(
         table = _cpb_overrides.get(dev_key)
     if table is None:
         return None
-    return table.get(f"{family}|{num_heads}|{topk}|{num_tokens}")
+    return table.get(
+        _cpb_override_key(
+            family,
+            num_heads,
+            topk,
+            num_tokens,
+            extra_topk,
+            extra_page_block_size,
+        )
+    )
 
 
 def save_cpb_override(
@@ -1215,12 +1676,22 @@ def save_cpb_override(
     topk: int,
     num_tokens: int,
     cpb: int,
+    *,
+    extra_topk: int = 0,
+    extra_page_block_size: int = 0,
 ) -> None:
-    """Merge one refined pick into the disk cache (read-modify-write, atomic
-    replace) and the process cache. Same failure semantics as
-    :func:`save_constants`."""
+    """Merge one exact-geometry refined pick into the disk/process cache."""
     dev_key = _device_key(device)
-    entry = {f"{family}|{num_heads}|{topk}|{num_tokens}": int(cpb)}
+    entry = {
+        _cpb_override_key(
+            family,
+            num_heads,
+            topk,
+            num_tokens,
+            extra_topk,
+            extra_page_block_size,
+        ): int(cpb)
+    }
     _publish_payload(_merge_into_cache(dev_key, _CPB_OVERRIDES_KEY, entry))
     _cpb_overrides.setdefault(dev_key, {}).update(entry)
 
@@ -1235,6 +1706,7 @@ def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...], int]]:
         _CALIBRATION_HEADS,
         _DECODE_DSV3_2_TOPKS,
         _DECODE_DSV4_TOPKS,
+        _DECODE_DSV4_MXFP8_TOPKS,
         _DECODE_GLM53_NOPE_CALIBRATION_GRID,
         _DECODE_DOTS3_SWA_CALIBRATION_GRID,
         _DECODE_GLM53_NOPE_TOPK,
@@ -1244,6 +1716,11 @@ def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...], int]]:
     v32_topks = tuple(sorted(_DECODE_DSV3_2_TOPKS))
     return {
         "dsv4": (_CALIBRATION_HEADS, tuple(sorted(_DECODE_DSV4_TOPKS)), 1),
+        "dsv4_mxfp8": (
+            _CALIBRATION_HEADS,
+            tuple(sorted(_DECODE_DSV4_MXFP8_TOPKS)),
+            1,
+        ),
         "dsv3_2": (_CALIBRATION_HEADS, v32_topks, 1),
         "glm_nsa": (_CALIBRATION_HEADS, v32_topks, 1),
         "glm53_nope": (
@@ -1301,14 +1778,17 @@ def calibrate_sparse_mla_sm120(
     heads: Optional[tuple[int, ...]] = None,
     topks: Optional[tuple[int, ...]] = None,
     families: Optional[tuple[str, ...]] = None,
+    dual_configs: Optional[tuple[tuple[int, int, int, int], ...]] = None,
+    calibrate_single_cache: bool = True,
     force: bool = False,
 ) -> SparseMLASm120CalibrationReport:
     """Calibrate the SM120 sparse-MLA decode model on ``device`` and persist it.
 
     One call does both layers: the per-family cpb constants (measured when
     absent, or always when ``force=True``) and then the decode/prefill
-    crossover entry for every requested ``(family, num_heads, topk)``
-    combination. Results merge into the JSON cache (see
+    single-cache crossover entry for every requested ``(family, num_heads,
+    topk)`` combination, plus any requested DSV4 dual-cache entries. Results
+    merge into the JSON cache (see
     :func:`default_cache_path`) and take effect in-process immediately (the
     ``_constants_version`` bump self-invalidates the plan memoization).
 
@@ -1342,10 +1822,20 @@ def calibrate_sparse_mla_sm120(
         values. Any width above the family minimum is accepted (topk is a
         runtime kernel argument).
     families : Optional[tuple[str, ...]]
-        Subset of ``{"dsv4", "dsv3_2", "glm_nsa", "glm53_nope",
-        "dots3_swa"}``; defaults to all. ``dsv3_2`` and ``glm_nsa`` share
-        constants and are measured in one sweep (requesting either calibrates
-        both key spaces).
+        Subset of ``{"dsv4", "dsv4_mxfp8", "dsv3_2", "glm_nsa",
+        "glm53_nope", "dots3_swa"}``. The default preserves the existing
+        FP8-family sweep; request ``"dsv4_mxfp8"`` explicitly to calibrate
+        MXFP8. ``dsv4`` and ``dsv4_mxfp8`` are independently calibrated. ``dsv3_2`` and
+        ``glm_nsa`` share constants and are measured in one sweep (requesting
+        either calibrates both key spaces).
+    dual_configs : Optional[tuple[tuple[int, int, int, int], ...]]
+        DSV4 dual-cache geometries as ``(num_heads, main_topk, extra_topk,
+        extra_page_block_size)``. Each requested FP8/MXFP8 family receives an
+        independent measured entry. Main and extra top-k must be whole
+        64-candidate tiles; the production main cache page size is 64.
+    calibrate_single_cache : bool
+        Whether to calibrate the single-cache ``heads`` x ``topks`` grid.
+        Set to ``False`` for a targeted dual-cache-only warmup.
     force : bool
         Re-measure entries already present in the cache.
 
@@ -1370,25 +1860,58 @@ def calibrate_sparse_mla_sm120(
     device = torch.device(device)
 
     specs = _family_specs()
-    fams = tuple(families) if families is not None else tuple(specs)
+    # Preserve the pre-MXFP8 default calibration work and cache contents for
+    # existing callers. MXFP8 is format-specific and is calibrated either by
+    # an explicit family request or lazily when that cache format is used.
+    fams = (
+        tuple(families)
+        if families is not None
+        else tuple(family for family in specs if family != "dsv4_mxfp8")
+    )
     unknown = [f for f in fams if f not in specs]
     if unknown:
         raise ValueError(
             f"unknown sparse-MLA families: {unknown}; available: {sorted(specs)}"
         )
 
+    dual = tuple(dual_configs or ())
+    if not calibrate_single_cache and not dual:
+        raise ValueError(
+            "calibrate_sparse_mla_sm120: no work requested; enable "
+            "calibrate_single_cache or provide dual_configs"
+        )
+
     # Validate every requested combination up front; nothing is measured or
     # written when any combination is out of envelope.
     invalid = []
-    for fam in fams:
-        grid_heads, grid_topks, min_topk = specs[fam]
-        for h in tuple(heads) if heads is not None else grid_heads:
-            for k in tuple(topks) if topks is not None else grid_topks:
-                if not (1 <= h <= 128 and k >= min_topk):
-                    invalid.append(
-                        f"{fam}(num_heads={h}, topk={k}) "
-                        f"[need 1<=num_heads<=128, topk>={min_topk}]"
-                    )
+    if calibrate_single_cache:
+        for fam in fams:
+            grid_heads, grid_topks, min_topk = specs[fam]
+            for h in tuple(heads) if heads is not None else grid_heads:
+                for k in tuple(topks) if topks is not None else grid_topks:
+                    if not (1 <= h <= 128 and k >= min_topk):
+                        invalid.append(
+                            f"{fam}(num_heads={h}, topk={k}) "
+                            f"[need 1<=num_heads<=128, topk>={min_topk}]"
+                        )
+    for h, main_topk, extra_topk, extra_page_block_size in dual:
+        if not (
+            1 <= h <= 128
+            and main_topk >= 64
+            and main_topk % 64 == 0
+            and extra_topk >= 64
+            and extra_topk % 64 == 0
+            and extra_page_block_size >= 1
+        ):
+            invalid.append(
+                "dual(num_heads="
+                f"{h}, main_topk={main_topk}, extra_topk={extra_topk}, "
+                f"extra_page_block_size={extra_page_block_size}) "
+                "[need 1<=num_heads<=128, positive 64-aligned top-k values, "
+                "and extra_page_block_size>=1]"
+            )
+    if dual and not any(f in ("dsv4", "dsv4_mxfp8") for f in fams):
+        invalid.append("dual_configs require families to include dsv4 or dsv4_mxfp8")
     if invalid:
         raise ValueError(
             "calibrate_sparse_mla_sm120: combinations outside the decode "
@@ -1423,10 +1946,10 @@ def calibrate_sparse_mla_sm120(
         constants[cpb_family] = c
         constants_calibrated.append(cpb_family)
 
-    # Phase 2: crossover entries, one sweep per cpb family over the requested
+    # Phase 2: single-cache crossover entries, one sweep per cpb family over the requested
     # pairs that still need measuring. The dsv3_2 sweep writes both the dsv3_2
     # and glm_nsa key spaces, so a request for either covers both.
-    for cpb_family in cpb_families:
+    for cpb_family in cpb_families if calibrate_single_cache else ():
         c = constants.get(cpb_family)
         if c is None:
             continue  # constants failed above; crossover entries need them
@@ -1469,6 +1992,53 @@ def calibrate_sparse_mla_sm120(
             for h, k in pairs:
                 if f"{fam}|{h}|{k}" in table:
                     entries_calibrated += 1
+
+    # Phase 3: targeted dual-cache entries. The exact compressed-cache page
+    # size is part of the key; single-cache calibration can neither satisfy
+    # nor suppress these measurements.
+    for family in ("dsv4", "dsv4_mxfp8"):
+        if family not in fams or not dual:
+            continue
+        c = constants.get(family)
+        if c is None:
+            continue
+        pending = []
+        for h, main_topk, extra_topk, extra_page_block_size in dual:
+            if (
+                not force
+                and get_decode_max_tokens(
+                    device,
+                    family,
+                    h,
+                    main_topk,
+                    extra_topk,
+                    extra_page_block_size,
+                )
+                is not None
+            ):
+                entries_skipped += 1
+            else:
+                pending.append((h, main_topk, extra_topk, extra_page_block_size))
+        if not pending:
+            continue
+        try:
+            table = calibrate_dual_crossover(
+                _get_sparse_mla_sm120_decode_module(),
+                device,
+                family,
+                c,
+                pending,
+            )
+        except (CalibrationError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            logger.warning(
+                "SM120 sparse-MLA %s dual-cache crossover calibration failed (%s)",
+                family,
+                e,
+            )
+            failed.append(f"{family} dual-cache crossover: {e}")
+            continue
+        save_crossover(device, table)
+        entries_calibrated += len(table)
 
     return SparseMLASm120CalibrationReport(
         device=_device_key(device),

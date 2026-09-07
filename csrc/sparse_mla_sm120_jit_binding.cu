@@ -7,6 +7,8 @@
 #include <cuda_runtime.h>
 #include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
 
+#include <cstdint>
+
 #include "tvm_ffi_utils.h"
 
 using tvm::ffi::Optional;
@@ -57,12 +59,16 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
   const size_t elem_bytes = static_cast<size_t>(kv.dtype().bits / 8);
   if (kv.ndim() == 2) {
     const size_t block_bytes = static_cast<size_t>(kv.size(1)) * elem_bytes;
+    const size_t block_stride = static_cast<size_t>(kv.stride(0)) * elem_bytes;
     TVM_FFI_ICHECK_EQ(block_bytes % static_cast<size_t>(bpt), 0)
         << name << " 2D block width " << block_bytes
         << " is not divisible by bytes_per_token=" << bpt;
+    TVM_FFI_ICHECK_GE(block_stride, block_bytes)
+        << name << " page stride " << block_stride << " is smaller than its " << block_bytes
+        << "-byte payload";
     // A flat 2D block carries no row padding to infer, so the row advance is
     // exactly bytes_per_token.
-    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_bytes, bpt};
+    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_stride, bpt};
   }
   auto row_advance = [&](int64_t token_axis) {
     TVM_FFI_ICHECK_EQ(kv.stride(-1), 1) << name << " last dim must be contiguous";
@@ -98,6 +104,21 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
   return {0, 0, 0};
 }
 
+inline void check_mxfp8_paged_layout(const TensorView& kv, const PagedKVLayout& layout,
+                                     const char* name) {
+  constexpr size_t kAlignment = alignof(uint4);
+  constexpr int kBytesPerToken = bytes_per_token(ModelType::DSV4_MXFP8);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(kv.data_ptr()) % kAlignment, 0)
+      << name << " MXFP8 base pointer must be " << kAlignment << "-byte aligned";
+  TVM_FFI_ICHECK_EQ(layout.stride_kv_block % kAlignment, 0)
+      << name << " MXFP8 page stride must be a multiple of " << kAlignment << " bytes";
+  TVM_FFI_ICHECK_GE(layout.stride_kv_block,
+                    static_cast<size_t>(layout.page_block_size) * kBytesPerToken)
+      << name << " MXFP8 page stride is smaller than its packed payload";
+  TVM_FFI_ICHECK_EQ(layout.stride_kv_row, kBytesPerToken)
+      << name << " MXFP8 entries inside a page must have stride " << kBytesPerToken;
+}
+
 }  // namespace
 
 // Thin TVM-FFI wrapper for the decode-dsv4 standalone path. The caller passes
@@ -110,7 +131,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
                               Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
                               Optional<TensorView> extra_kv_cache,
                               Optional<TensorView> extra_indices,
-                              Optional<TensorView> extra_topk_length,
+                              Optional<TensorView> extra_topk_length, int64_t model_type,
                               int64_t chunks_per_block_override) {
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
   TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2);
@@ -141,11 +162,23 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       << "indices leading dimension must match num_tokens";
   const int topk = static_cast<int>(indices.size(-1));
   const int d_qk = static_cast<int>(q.size(2));
-  // This kernel serves the footer-scale model types. d_qk selects between them:
-  // 512 -> DSV4, 1088 -> DOTS3_SWA (sliding-window family, d_v 1024).
+  // This kernel serves the footer-scale model types. d_qk selects the model
+  // family while model_type disambiguates the two DSV4 cache ABIs.
   TVM_FFI_ICHECK(d_qk == 512 || d_qk == 1088)
       << "decode-dsv4 supports d_qk 512 (DSV4) or 1088 (DOTS3_SWA); got " << d_qk;
-  const ModelType mt = (d_qk == 512) ? ModelType::DSV4 : ModelType::DOTS3_SWA;
+  constexpr int64_t kAutoModelType = -1;
+  ModelType mt = ModelType::DSV4;
+  if (d_qk == 512) {
+    mt = static_cast<ModelType>(model_type == kAutoModelType ? static_cast<int64_t>(ModelType::DSV4)
+                                                             : model_type);
+  } else {
+    TVM_FFI_ICHECK(model_type == kAutoModelType ||
+                   static_cast<ModelType>(model_type) == ModelType::DOTS3_SWA)
+        << "d_qk=1088 supports only model_type auto or DOTS3_SWA; got " << model_type;
+    mt = ModelType::DOTS3_SWA;
+  }
+  TVM_FFI_ICHECK(mt == ModelType::DSV4 || mt == ModelType::DSV4_MXFP8 || mt == ModelType::DOTS3_SWA)
+      << "decode-dsv4 supports DSV4, DSV4_MXFP8, or DOTS3_SWA; got model_type=" << model_type;
   // DOTS3_SWA's sliding window (513 candidates, DecodeTileCfg::WINDOW) needs an
   // indices buffer at least that wide; a narrower one can never name the full
   // window. Report it here so the message names the actual constraint.
@@ -163,6 +196,9 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   // the QK mask turns into -inf.
   const int bpt = bytes_per_token(mt);
   const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bpt, "kv_cache");
+  if (mt == ModelType::DSV4_MXFP8) {
+    check_mxfp8_paged_layout(kv_cache, kv_layout, "kv_cache");
+  }
   // Footer-scale kernels (DSV4, DOTS3_SWA) gather with a tightly packed row
   // advance; only the decode-v32 path honors stride_kv_row. Reject padded rows
   // loudly instead of reading the wrong bytes.
@@ -202,6 +238,9 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
     stride_extra_indices_token = static_cast<size_t>(eidx.stride(0));
     // The extra (dual) cache carries the same per-token layout as the main one.
     const PagedKVLayout extra_layout = parse_paged_kv_layout(ekv, bpt, "extra_kv_cache");
+    if (mt == ModelType::DSV4_MXFP8) {
+      check_mxfp8_paged_layout(ekv, extra_layout, "extra_kv_cache");
+    }
     TVM_FFI_ICHECK_EQ(extra_layout.stride_kv_row, bpt)
         << "decode-dsv4 extra_kv_cache requires tightly packed KV rows "
         << "(stride_kv_row == bytes_per_token=" << bpt

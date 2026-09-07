@@ -93,14 +93,16 @@ template <ModelType MT>
 struct DecodeDsv4Smem {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT>;
+  using CT = ComputeTraits<MT, ComputeMode::FP8, Cfg::BI, Cfg::N_WARPS>;
   // This layout assumes footer scales (a separate kv_sc buffer) and a KV smem
   // region holding nope only. Both DSV4 and DOTS3_SWA satisfy that; the inline-
   // scale models (DSV3_2 / GLM_NSA) bulk-copy their scales inside the KV region
   // and use decode_dsv3_2_kernel.cuh instead.
-  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA);
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DSV4_MXFP8 || MT == ModelType::DOTS3_SWA);
   static_assert(!KV::SCALE_IN_KV_SMEM, "this smem layout keeps scales in a separate buffer");
 
-  static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
+  static constexpr int N_V_CHUNKS = CT::N_V_CHUNKS;
+  static constexpr int SCALE_GROUPS_PER_V_CHUNK = CT::SCALE_GROUPS_PER_V_CHUNK;
   static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
   static constexpr size_t SMEM_Q_FP8 = HPB * KV::Q_NOPE_STRIDE;
   static constexpr size_t SMEM_Q_SC = HPB * KV::NUM_SCALES * sizeof(float);
@@ -109,8 +111,12 @@ struct DecodeDsv4Smem {
   static constexpr size_t SMEM_KV_ROPE_BUF = Cfg::BI * KV::D_ROPE * sizeof(bf16);
   static constexpr size_t SMEM_MBAR_PAIR = 2 * sizeof(uint64_t);
   static constexpr size_t SMEM_REDUCE = 2 * Cfg::N_WARPS * HPB * sizeof(float);
+  // Both g32 P matrices in a 64-D MXFP8 macro tile share one conservative
+  // online-quantization scale.  Their values remain distinct; only the
+  // temporary P scale is shared.
   static constexpr size_t SMEM_W_HEAD_SC = N_V_CHUNKS * HPB * sizeof(float);
-  static constexpr size_t SMEM_W_FP8_BUF = HPB * (Cfg::BI + 16);
+  static constexpr size_t SMEM_W_FP8_ONE = HPB * (Cfg::BI + 16);
+  static constexpr size_t SMEM_W_FP8_BUF = SCALE_GROUPS_PER_V_CHUNK * SMEM_W_FP8_ONE;
 
   static constexpr size_t OFF_Q_ROPE = 0;
   static constexpr size_t OFF_Q_FP8 = OFF_Q_ROPE + SMEM_Q_ROPE;
@@ -161,8 +167,9 @@ struct DecodeDsv4Smem {
   __device__ __forceinline__ float* w_head_sc() const {
     return reinterpret_cast<float*>(base + OFF_W_HEAD_SC);
   }
-  __device__ __forceinline__ uint8_t* w_fp8(int parity) const {
-    return reinterpret_cast<uint8_t*>(base + OFF_W_FP8 + parity * SMEM_W_FP8_BUF);
+  __device__ __forceinline__ uint8_t* w_fp8(int parity, int scale_group = 0) const {
+    return reinterpret_cast<uint8_t*>(base + OFF_W_FP8 + parity * SMEM_W_FP8_BUF +
+                                      scale_group * SMEM_W_FP8_ONE);
   }
 };
 
@@ -191,8 +198,8 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     size_t stride_indices_token, size_t stride_extra_indices_token) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT>;
-  static_assert(MT == ModelType::DSV4 || MT == ModelType::DOTS3_SWA,
-                "decode-dsv4 serves the footer-scale model types (DSV4, DOTS3_SWA)");
+  static_assert(MT == ModelType::DSV4 || MT == ModelType::DSV4_MXFP8 || MT == ModelType::DOTS3_SWA,
+                "decode-dsv4 serves the footer-scale model types");
   constexpr int D_NOPE = KV::D_NOPE;                                // 448
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 512
@@ -271,14 +278,18 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     return;
   }
 
-  constexpr int V_CHUNK = QUANT_TILE;                          // 64
-  constexpr int N_V_CHUNKS = D_NOPE / V_CHUNK;                 // 7
-  constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / Cfg::N_WARPS;   // 1
+  using CT = ComputeTraits<MT, ComputeMode::FP8, Cfg::BI, Cfg::N_WARPS>;
+  constexpr int V_CHUNK = CT::V_CHUNK;        // 64 for both DSV4 formats
+  constexpr int N_V_CHUNKS = CT::N_V_CHUNKS;  // 7
+  constexpr int SCALE_GROUPS_PER_V_CHUNK = CT::SCALE_GROUPS_PER_V_CHUNK;
+  constexpr int NT_PER_WARP_XV = CT::NT_PER_WARP_XV;           // 1
   constexpr int XV_KSTEPS = Cfg::BI / 32;                      // 2
   constexpr int W_FP8_STRIDE = Cfg::BI + 16;                   // 80
   constexpr int ROPE_DIMS_PER_WARP = D_ROPE_C / Cfg::N_WARPS;  // 8
   constexpr int ROPE_N_TILES = ROPE_DIMS_PER_WARP / 8;         // 1
   constexpr int ROPE_K_ITERS = Cfg::BI / 16;                   // 4
+  static_assert(V_CHUNK == QUANT_TILE * SCALE_GROUPS_PER_V_CHUNK,
+                "each PV macro tile must contain whole quantization groups");
 
   // Whether rope participates in V. DSV4: D_V = D_NOPE + D_ROPE, so the output
   // row carries a rope segment at [D_NOPE, D_V) fed by a P×V_rope MMA.
@@ -372,10 +383,12 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
       idx_raw[e] = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
     }
 
-    uint64_t scale_word[EPW];
+    uint64_t scale_word_lo[EPW];
+    uint64_t scale_word_hi[EPW];
 #pragma unroll
     for (int e = 0; e < EPW; e++) {
-      scale_word[e] = 0;
+      scale_word_lo[e] = 0;
+      scale_word_hi[e] = 0;
       if (idx_raw[e] >= 0) {
         const int idx = idx_raw[e];
         const int block_idx_g = idx / section_pbs;
@@ -383,13 +396,21 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
         const uint8_t* scale_base = section_kv + (size_t)block_idx_g * section_stride +
                                     (size_t)section_pbs * IO_STRIDE +
                                     (size_t)local_idx_g * SCALE_BYTES_PER_TOKEN;
-        scale_word[e] = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
+        scale_word_lo[e] = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
+        if constexpr (SCALE_BYTES_PER_TOKEN == 16) {
+          scale_word_hi[e] = __ldg(reinterpret_cast<const uint64_t*>(scale_base + 8));
+        }
       }
     }
 #pragma unroll
     for (int e = 0; e < EPW; e++) {
       *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)(e * Cfg::IO_THREADS + lane) *
-                                                   SCALE_BYTES_PER_TOKEN) = scale_word[e];
+                                                   SCALE_BYTES_PER_TOKEN) = scale_word_lo[e];
+      if constexpr (SCALE_BYTES_PER_TOKEN == 16) {
+        *reinterpret_cast<uint64_t*>(
+            kv_sc_dst + (size_t)(e * Cfg::IO_THREADS + lane) * SCALE_BYTES_PER_TOKEN + 8) =
+            scale_word_hi[e];
+      }
     }
     __threadfence_block();
 
@@ -718,12 +739,40 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
         const int cand_e1 = cand_e0 + 1;
 #pragma unroll
         for (int vc = 0; vc < N_V_CHUNKS; vc++) {
-          const float vsc0 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
-          const float vsc1 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
-          atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid]),
-                    __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0), fabsf(w_pre[nt][1] * vsc1))));
-          atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid + 8]),
-                    __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0), fabsf(w_pre[nt][3] * vsc1))));
+          if constexpr (SCALE_GROUPS_PER_V_CHUNK == 1) {
+            // Keep the established FP8 path instruction-for-instruction: it
+            // is the default cache ABI and must not pay for MXFP8 support.
+            const float vsc0 =
+                ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
+            const float vsc1 =
+                ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+            atomicMax(
+                reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid]),
+                __float_as_int(fmaxf(fabsf(w_pre[nt][0] * vsc0), fabsf(w_pre[nt][1] * vsc1))));
+            atomicMax(
+                reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid + 8]),
+                __float_as_int(fmaxf(fabsf(w_pre[nt][2] * vsc0), fabsf(w_pre[nt][3] * vsc1))));
+          } else {
+            float max_vsc0 = 0.f, max_vsc1 = 0.f;
+#pragma unroll
+            for (int sg = 0; sg < SCALE_GROUPS_PER_V_CHUNK; sg++) {
+              const int sc_idx = vc * SCALE_GROUPS_PER_V_CHUNK + sg;
+              const float vsc0 =
+                  ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + sc_idx]);
+              const float vsc1 =
+                  ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + sc_idx]);
+              max_vsc0 = fmaxf(max_vsc0, vsc0);
+              max_vsc1 = fmaxf(max_vsc1, vsc1);
+            }
+            const float vmax0 =
+                fmaxf(fabsf(w_pre[nt][0]) * max_vsc0, fabsf(w_pre[nt][1]) * max_vsc1);
+            const float vmax1 =
+                fmaxf(fabsf(w_pre[nt][2]) * max_vsc0, fabsf(w_pre[nt][3]) * max_vsc1);
+            atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid]),
+                      __float_as_int(vmax0));
+            atomicMax(reinterpret_cast<int*>(&sm.w_head_sc()[vc * HPB + gid + 8]),
+                      __float_as_int(vmax1));
+          }
         }
       }
     }
@@ -738,35 +787,69 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
       // Double-buffered: vc=N quants into buf[N&1]; vc=N+1's quant targets the
       // OTHER buffer, so it cannot race with vc=N's MMA read. The bar_sync
       // after quant is the only sync needed within the vc loop.
-      uint8_t* sm_w_fp8 = sm.w_fp8(vc & 1);
       // Phase 3 quant.
       {
         const int warp_first_cand_xv = warp_id * Cfg::ENTRIES_PER_WARP;
         const float si0 = 1.f / sm.w_head_sc()[vc * HPB + gid];
         const float si1 = 1.f / sm.w_head_sc()[vc * HPB + gid + 8];
+        if constexpr (SCALE_GROUPS_PER_V_CHUNK == 1) {
+          uint8_t* sm_w_fp8 = sm.w_fp8(vc & 1);
 #pragma unroll
-        for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
-          const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
-          const int cand_e1 = cand_e0 + 1;
-          const float vsc0 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
-          const float vsc1 = ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
-          __nv_fp8_e4m3 f00(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][0] * vsc0 * si0)));
-          __nv_fp8_e4m3 f01(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][1] * vsc1 * si0)));
-          __nv_fp8_e4m3 f10(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][2] * vsc0 * si1)));
-          __nv_fp8_e4m3 f11(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][3] * vsc1 * si1)));
-          sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e0] = f00.__x;
-          sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e1] = f01.__x;
-          sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e0] = f10.__x;
-          sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e1] = f11.__x;
+          for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
+            const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
+            const int cand_e1 = cand_e0 + 1;
+            const float vsc0 =
+                ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + vc]);
+            const float vsc1 =
+                ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + vc]);
+            __nv_fp8_e4m3 f00(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][0] * vsc0 * si0)));
+            __nv_fp8_e4m3 f01(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][1] * vsc1 * si0)));
+            __nv_fp8_e4m3 f10(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][2] * vsc0 * si1)));
+            __nv_fp8_e4m3 f11(fmaxf(FP8_MIN, fminf(FP8_MAX, w_pre[nt][3] * vsc1 * si1)));
+            sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e0] = f00.__x;
+            sm_w_fp8[(size_t)gid * W_FP8_STRIDE + cand_e1] = f01.__x;
+            sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e0] = f10.__x;
+            sm_w_fp8[(size_t)(gid + 8) * W_FP8_STRIDE + cand_e1] = f11.__x;
+          }
+        } else {
+          // Both g32 matrices inside this 64-D macro tile share the
+          // temporary P scale, so its reciprocal is reused across groups.
+#pragma unroll
+          for (int sg = 0; sg < SCALE_GROUPS_PER_V_CHUNK; sg++) {
+            const int sc_idx = vc * SCALE_GROUPS_PER_V_CHUNK + sg;
+            uint8_t* sm_w_fp8 = sm.w_fp8(vc & 1, sg);
+#pragma unroll
+            for (int nt = 0; nt < Cfg::QK_N_TILES; nt++) {
+              const int cand_e0 = warp_first_cand_xv + nt * 8 + tid * 2;
+              const int cand_e1 = cand_e0 + 1;
+              const float vsc0 =
+                  ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e0 * SCALE_BYTES_PER_TOKEN + sc_idx]);
+              const float vsc1 =
+                  ue8m0_to_fp32(sm_kv_sc[(size_t)cand_e1 * SCALE_BYTES_PER_TOKEN + sc_idx]);
+              const uint32_t fp8x4 =
+                  cvt_e4m3x4(w_pre[nt][0] * vsc0 * si0, w_pre[nt][1] * vsc1 * si0,
+                             w_pre[nt][2] * vsc0 * si1, w_pre[nt][3] * vsc1 * si1);
+              *reinterpret_cast<uint16_t*>(sm_w_fp8 + (size_t)gid * W_FP8_STRIDE + cand_e0) =
+                  static_cast<uint16_t>(fp8x4);
+              *reinterpret_cast<uint16_t*>(sm_w_fp8 + (size_t)(gid + 8) * W_FP8_STRIDE + cand_e0) =
+                  static_cast<uint16_t>(fp8x4 >> 16);
+            }
+          }
         }
       }
       bar_sync_t<3, Cfg::MATH_THREADS>();
-      // Phase 4 FP8 MMA. Accumulate into persistent acc_nope[vc][nt][k].
+      // Phase 4 FP8 MMA. MXFP8 selects the g32 P matrix belonging to the
+      // output half of the 64-D scheduling tile; baseline FP8 has one matrix.
       const float sc0 = sm.w_head_sc()[vc * HPB + gid];
       const float sc1 = sm.w_head_sc()[vc * HPB + gid + 8];
 #pragma unroll
       for (int nt = 0; nt < NT_PER_WARP_XV; nt++) {
         const int dim = vc * V_CHUNK + warp_id * (NT_PER_WARP_XV * 8) + nt * 8;
+        const uint8_t* sm_w_fp8 = sm.w_fp8(vc & 1);
+        if constexpr (SCALE_GROUPS_PER_V_CHUNK == 2) {
+          const int sg = (dim % V_CHUNK) / QUANT_TILE;
+          sm_w_fp8 = sm.w_fp8(vc & 1, sg);
+        }
         float xv[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
         for (int kstep = 0; kstep < XV_KSTEPS; kstep++) {

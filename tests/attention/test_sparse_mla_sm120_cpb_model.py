@@ -39,6 +39,7 @@ from flashinfer.mla._sparse_mla_sm120_cpb import (
     predict_time_s,
     select_cpb,
 )
+from flashinfer.mla._sparse_mla_sm120_plan import _MODEL_TYPE_DSV4
 from flashinfer.utils import is_sm12x_supported
 
 requires_sm12x = pytest.mark.skipif(
@@ -163,6 +164,24 @@ def test_crossover_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:
     assert cpb_mod.has_crossover(device, "dsv3_2")
 
 
+def test_dual_crossover_keys_are_exact_and_persistent(
+    clean_cpb_state, monkeypatch
+) -> None:
+    """Single-cache and dual-cache entries never alias; extra top-k and the
+    compressed-cache page size are both routing dimensions."""
+    device = torch.device("cpu")
+    single = cpb_mod._crossover_key("dsv4_mxfp8", 64, 128)
+    dual = cpb_mod._crossover_key("dsv4_mxfp8", 64, 128, 512, 2)
+    cpb_mod.save_crossover(device, {single: 0, dual: 16})
+    cpb_mod._crossover.clear()
+    monkeypatch.setattr(cpb_mod, "_cache_mtime", -1.0)
+
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4_mxfp8", 64, 128) == 0
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4_mxfp8", 64, 128, 512, 2) == 16
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4_mxfp8", 64, 128, 512, 64) is None
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4_mxfp8", 64, 128, 128, 2) is None
+
+
 def test_dsv3_2_crossover_requires_glm_nsa_entries(
     clean_cpb_state, monkeypatch
 ) -> None:
@@ -197,6 +216,96 @@ def test_cpb_override_persistence_round_trip(clean_cpb_state, monkeypatch) -> No
     assert cpb_mod.get_cpb_override(device, "dsv4", 128, 1024, 64) == 12
     assert cpb_mod.get_constants(device, "dsv4") == _C
     assert cpb_mod.get_decode_max_tokens(device, "dsv4", 128, 1024) == 16
+
+
+def test_dual_cpb_override_keys_are_exact_and_persistent(
+    clean_cpb_state, monkeypatch
+) -> None:
+    """A legacy single-cache CPB tactic must not leak into a dual-cache call;
+    dual tactics are isolated by secondary top-k and page size."""
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
+
+    device = torch.device("cpu")
+    family = "dsv4_mxfp8"
+    num_tokens, num_heads, topk = 16, 64, 128
+    extra_topk, extra_page_size = 512, 2
+    c = CpbConstants(**{**_C.__dict__, "bytes_per_chunk": 37888})
+    model_cpb = select_cpb(num_tokens, num_heads, topk, extra_topk, c)
+    num_chunks = -(-topk // 64) + -(-extra_topk // 64)
+    dual_override = model_cpb % num_chunks + 1
+    single_override = dual_override % num_chunks + 1
+
+    cpb_mod.save_constants(device, family, c)
+    cpb_mod.save_cpb_override(
+        device, family, num_heads, topk, num_tokens, single_override
+    )
+    cpb_mod.save_cpb_override(
+        device,
+        family,
+        num_heads,
+        topk,
+        num_tokens,
+        dual_override,
+        extra_topk=extra_topk,
+        extra_page_block_size=extra_page_size,
+    )
+    cpb_mod._cpb_overrides.clear()
+    plan_mod._cpb_hot_cache.clear()
+    monkeypatch.setattr(cpb_mod, "_cache_mtime", -1.0)
+
+    assert (
+        cpb_mod.get_cpb_override(device, family, num_heads, topk, num_tokens)
+        == single_override
+    )
+    assert (
+        cpb_mod.get_cpb_override(
+            device,
+            family,
+            num_heads,
+            topk,
+            num_tokens,
+            extra_topk,
+            extra_page_size,
+        )
+        == dual_override
+    )
+    assert (
+        cpb_mod.get_cpb_override(
+            device,
+            family,
+            num_heads,
+            topk,
+            num_tokens,
+            extra_topk,
+            64,
+        )
+        is None
+    )
+
+    assert (
+        plan_mod._resolve_cpb(
+            device,
+            family,
+            num_tokens,
+            num_heads,
+            topk,
+            extra_topk,
+            extra_page_size,
+        )
+        == dual_override
+    )
+    assert (
+        plan_mod._resolve_cpb(
+            device,
+            family,
+            num_tokens,
+            num_heads,
+            topk,
+            extra_topk,
+            64,
+        )
+        == model_cpb
+    )
 
 
 def test_crossover_grid_complete_gates_full_sweep(clean_cpb_state) -> None:
@@ -361,8 +470,7 @@ def test_model_cpb_accuracy_guard(
     )
 
     def run(cpb_override: int) -> float:
-        # model_type is unused by the dsv4 FFI branch of the call builder.
-        call = build(num_tokens, num_heads, topk, 0, cpb_override)
+        call = build(num_tokens, num_heads, topk, _MODEL_TYPE_DSV4, cpb_override)
         return cpb_mod._time_call_fresh_indices(
             call, num_tokens, topk, num_slots, device, c.bytes_per_chunk // 64
         )
@@ -460,6 +568,7 @@ def test_model_cpb_accuracy_guard_dual_cache(
                 extra_kv_cache,
                 extra_indices,
                 None,
+                _MODEL_TYPE_DSV4,
                 cpb_override,
             )
 
@@ -520,8 +629,7 @@ def test_refine_cpb_beats_or_matches_model(
     build = cpb_mod._make_decode_call_builder(module, "dsv4", device, kv_cache)
 
     def timed(cpb: int) -> float:
-        # model_type is unused by the dsv4 FFI branch of the call builder.
-        call = build(num_tokens, num_heads, topk, 0, cpb)
+        call = build(num_tokens, num_heads, topk, _MODEL_TYPE_DSV4, cpb)
         return cpb_mod._time_call_fresh_indices(
             call, num_tokens, topk, num_slots, device, c.bytes_per_chunk // 64
         )
@@ -763,6 +871,105 @@ def test_public_calibrate_lists_all_invalid_combinations(clean_cpb_state) -> Non
     assert "num_heads=256" in msg and "topk=512" in msg and "topk>=513" in msg
     # The legal combination (64, 576) must not be blamed.
     assert "(num_heads=64, topk=576)" not in msg
+
+
+def test_public_calibrate_dual_only_is_idempotent(clean_cpb_state, monkeypatch) -> None:
+    """The public warmup can target an exact dual-cache geometry without
+    running the single-cache crossover grid."""
+    from types import SimpleNamespace
+
+    import flashinfer.mla
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+
+    device = torch.device("cpu")
+    config = (64, 128, 512, 2)
+    calls = {"constants": 0, "single": 0, "dual": 0}
+
+    def fake_constants(module_getter, family, dev):
+        calls["constants"] += 1
+        assert family == "dsv4_mxfp8"
+        return _C
+
+    def fake_single(*args, **kwargs):
+        calls["single"] += 1
+        raise AssertionError("single-cache calibration must not run")
+
+    def fake_dual(module, dev, family, constants, configs):
+        calls["dual"] += 1
+        assert family == "dsv4_mxfp8"
+        assert configs == [config]
+        return {cpb_mod._crossover_key(family, *config): 16}
+
+    monkeypatch.setattr(cpb_mod, "calibrate", fake_constants)
+    monkeypatch.setattr(cpb_mod, "calibrate_crossover", fake_single)
+    monkeypatch.setattr(cpb_mod, "calibrate_dual_crossover", fake_dual)
+    monkeypatch.setattr(
+        sm,
+        "_get_sparse_mla_sm120_decode_module",
+        lambda: SimpleNamespace(),
+    )
+
+    report = flashinfer.mla.calibrate_sparse_mla_sm120(
+        device,
+        families=("dsv4_mxfp8",),
+        dual_configs=(config,),
+        calibrate_single_cache=False,
+    )
+    assert report.failed == ()
+    assert report.entries_calibrated == 1
+    assert report.entries_skipped == 0
+    assert calls == {"constants": 1, "single": 0, "dual": 1}
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4_mxfp8", *config) == 16
+
+    report = flashinfer.mla.calibrate_sparse_mla_sm120(
+        device,
+        families=("dsv4_mxfp8",),
+        dual_configs=(config,),
+        calibrate_single_cache=False,
+    )
+    assert report.constants_present == ("dsv4_mxfp8",)
+    assert report.entries_calibrated == 0
+    assert report.entries_skipped == 1
+    assert calls == {"constants": 1, "single": 0, "dual": 1}
+
+
+def test_tuning_lazily_calibrates_exact_dual_geometry(
+    clean_cpb_state, monkeypatch
+) -> None:
+    """A tuning-mode dual call measures its exact cache geometry once and
+    publishes the entry for the next memoized plan decision."""
+    from types import SimpleNamespace
+
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla._sparse_mla_sm120_plan import _resolve_cpb
+
+    device = torch.device("cpu")
+    config = (64, 128, 512, 2)
+    cpb_mod.save_constants(device, "dsv4_mxfp8", _C)
+    monkeypatch.setattr(cpb_mod, "crossover_grid_complete", lambda *args: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
+    monkeypatch.setattr(
+        sm,
+        "_get_sparse_mla_sm120_decode_module",
+        lambda: SimpleNamespace(),
+    )
+    calls = []
+
+    def fake_dual(module, dev, family, constants, configs):
+        calls.append((family, configs))
+        return {cpb_mod._crossover_key(family, *config): 16}
+
+    monkeypatch.setattr(cpb_mod, "calibrate_dual_crossover", fake_dual)
+    _resolve_cpb(device, "dsv4_mxfp8", 8, *config)
+    assert calls == [("dsv4_mxfp8", [config])]
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4_mxfp8", *config) == 16
+
+    # The persisted exact key suppresses a duplicate calibration.
+    _resolve_cpb(device, "dsv4_mxfp8", 8, *config)
+    assert calls == [("dsv4_mxfp8", [config])]
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4_mxfp8", *config) == 16
 
 
 @requires_sm12x

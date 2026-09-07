@@ -36,6 +36,7 @@
 #include <cuda_runtime.h>
 #include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
 
+#include <cstdint>
 #include <flashinfer/attention/sparse_mla_sm120/arch/common.cuh>
 
 #include "tvm_ffi_utils.h"
@@ -69,8 +70,9 @@ inline ModelType resolve_model_type(int d_qk, int64_t model_type) {
   if (d_qk == 512) {
     const auto mt = static_cast<ModelType>(
         model_type == kAuto ? static_cast<int64_t>(ModelType::DSV4) : model_type);
-    TVM_FFI_ICHECK(mt == ModelType::DSV4 || mt == ModelType::GLM53_NOPE)
-        << "d_qk=512 supports model_type auto, DSV4, or GLM53_NOPE; got " << model_type;
+    TVM_FFI_ICHECK(mt == ModelType::DSV4 || mt == ModelType::DSV4_MXFP8 ||
+                   mt == ModelType::GLM53_NOPE)
+        << "d_qk=512 supports model_type auto, DSV4, DSV4_MXFP8, or GLM53_NOPE; got " << model_type;
     return mt;
   }
   if (d_qk == 1088) {
@@ -99,10 +101,14 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
   const size_t elem_bytes = static_cast<size_t>(kv.dtype().bits / 8);
   if (kv.ndim() == 2) {
     const size_t block_bytes = static_cast<size_t>(kv.size(1)) * elem_bytes;
+    const size_t block_stride = static_cast<size_t>(kv.stride(0)) * elem_bytes;
     TVM_FFI_ICHECK_EQ(block_bytes % static_cast<size_t>(bpt), 0)
         << name << " 2D block width " << block_bytes
         << " is not divisible by bytes_per_token=" << bpt;
-    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_bytes};
+    TVM_FFI_ICHECK_GE(block_stride, block_bytes)
+        << name << " page stride " << block_stride << " is smaller than its " << block_bytes
+        << "-byte payload";
+    return {static_cast<int>(block_bytes / static_cast<size_t>(bpt)), block_stride};
   }
   if (kv.ndim() == 3) {
     TVM_FFI_ICHECK_EQ(kv.size(-1), bpt)
@@ -128,6 +134,25 @@ inline PagedKVLayout parse_paged_kv_layout(const TensorView& kv, int bpt, const 
   TVM_FFI_ICHECK(false) << name << " 4D form must have singleton KV-head axis at dim 1 "
                         << "(HND) or dim 2 (NHD)";
   return {0, 0};
+}
+
+inline void check_mxfp8_paged_layout(const TensorView& kv, const PagedKVLayout& layout,
+                                     const char* name) {
+  constexpr size_t kAlignment = alignof(uint4);
+  constexpr int kBytesPerToken = bytes_per_token(ModelType::DSV4_MXFP8);
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(kv.data_ptr()) % kAlignment, 0)
+      << name << " MXFP8 base pointer must be " << kAlignment << "-byte aligned";
+  TVM_FFI_ICHECK_EQ(layout.stride_kv_block % kAlignment, 0)
+      << name << " MXFP8 page stride must be a multiple of " << kAlignment << " bytes";
+  TVM_FFI_ICHECK_GE(layout.stride_kv_block,
+                    static_cast<size_t>(layout.page_block_size) * kBytesPerToken)
+      << name << " MXFP8 page stride is smaller than its packed payload";
+  if (kv.ndim() >= 3) {
+    const int token_axis = kv.ndim() == 3 ? 1 : (kv.size(1) == 1 ? 2 : 1);
+    TVM_FFI_ICHECK_EQ(static_cast<size_t>(kv.stride(token_axis)),
+                      static_cast<size_t>(kBytesPerToken))
+        << name << " MXFP8 entries inside a page must have stride " << kBytesPerToken;
+  }
 }
 
 inline int check_dense_indices_2d_or_s_q_3d(const TensorView& idx, const char* name,
@@ -185,6 +210,9 @@ void SparseMlaSm120PagedAttention(
   const int topk = check_dense_indices_2d_or_s_q_3d(indices, "indices", num_tokens);
   const ModelType mt = resolve_model_type(d_qk, model_type);
   const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, bytes_per_token(mt), "kv_cache");
+  if (mt == ModelType::DSV4_MXFP8) {
+    check_mxfp8_paged_layout(kv_cache, kv_layout, "kv_cache");
+  }
   const int page_block_size = kv_layout.page_block_size;
   // Inline-scale models (DSV3_2 / GLM_NSA / GLM53_NOPE) are addressed by the
   // prefill kernels as a flat token array (prefill_kv_entry_base), so a
@@ -264,6 +292,9 @@ void SparseMlaSm120PagedAttention(
     CHECK_INPUT_AND_TYPE(eidx, dl_int32);
     const PagedKVLayout extra_layout =
         parse_paged_kv_layout(ekv, bytes_per_token(mt), "extra_kv_cache");
+    if (mt == ModelType::DSV4_MXFP8) {
+      check_mxfp8_paged_layout(ekv, extra_layout, "extra_kv_cache");
+    }
     extra_page_block_size = extra_layout.page_block_size;
     extra_stride_kv_block = extra_layout.stride_kv_block;
     extra_topk = check_dense_indices_2d_or_s_q_3d(eidx, "extra_indices", num_tokens);
@@ -326,9 +357,12 @@ void SparseMlaSm120PagedAttention(
       break;
     case ModelType::DSV4:
       break;
+    case ModelType::DSV4_MXFP8:
+      mt_name = "DSV4_MXFP8";
+      break;
   }
-  TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
-                     << "model=" << mt_name << " num_heads=" << num_heads << " topk=" << topk
+  TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: " << "model=" << mt_name
+                     << " num_heads=" << num_heads << " topk=" << topk
                      << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
                      << " extra_page_block_size=" << extra_page_block_size
                      << " variant=" << variant;

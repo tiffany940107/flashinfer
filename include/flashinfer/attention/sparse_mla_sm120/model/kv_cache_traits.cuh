@@ -229,6 +229,19 @@ struct KVCacheTraits<ModelType::DSV4> {
   __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) { return scale; }
 };
 
+// DSV4 with the standard MXFP8 microscaling granularity. The 576-byte data
+// rows are byte-compatible with DSV4 (448 E4M3 NoPE bytes followed by 64 BF16
+// RoPE values); only the page footer changes from seven g64 scales in an
+// 8-byte slot to fourteen g32 scales in a 16-byte slot.
+template <>
+struct KVCacheTraits<ModelType::DSV4_MXFP8> : KVCacheTraits<ModelType::DSV4> {
+  static constexpr int QUANT_TILE = 32;
+  static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;  // 14
+  static constexpr int SCALE_BYTES_PER_TOKEN = 16;        // 14×UE8M0 + 2 pad
+  static constexpr int KV_GMEM_STRIDE =
+      D_NOPE + D_ROPE * sizeof(bf16) + SCALE_BYTES_PER_TOKEN;  // 592
+};
+
 // ============================================================================
 // Shared constants across all model types
 // ============================================================================
@@ -248,6 +261,8 @@ static_assert(KVCacheTraits<ModelType::DSV3_2>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DSV3_2>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::DSV4>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DSV4>::D_V == D_V);
+static_assert(KVCacheTraits<ModelType::DSV4_MXFP8>::D_ROPE == D_ROPE);
+static_assert(KVCacheTraits<ModelType::DSV4_MXFP8>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_ROPE == 0);
@@ -304,13 +319,30 @@ struct ComputeTraits;
 template <ModelType MT, int TILE_BI, int TILE_MATH_WARPS>
 struct ComputeTraits<MT, ComputeMode::FP8, TILE_BI, TILE_MATH_WARPS> {
   using KV = KVCacheTraits<MT>;
-  static constexpr int V_CHUNK = KV::QUANT_TILE;                        // DSV3_2=128, DSV4=64
-  static constexpr int N_V_CHUNKS = KV::D_NOPE / V_CHUNK;               // DSV3_2=4, DSV4=7
+  static constexpr int V_CHUNK = KV::QUANT_TILE;           // DSV3_2=128, DSV4=64
+  static constexpr int N_V_CHUNKS = KV::D_NOPE / V_CHUNK;  // DSV3_2=4, DSV4=7
+  static constexpr int SCALE_GROUPS_PER_V_CHUNK = 1;
   static constexpr int V_TRANS_STRIDE = TILE_BI + 16;                   // 80 at BI=64
   static constexpr int W_FP8_STRIDE = TILE_BI + 16;                     // 80 at BI=64
   static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / TILE_MATH_WARPS;  // DSV3_2=2, DSV4=1
   static constexpr int ACC_TILES = N_V_CHUNKS * NT_PER_WARP_XV;         // DSV3_2=8, DSV4=7
   static constexpr int XV_KSTEPS = TILE_BI / 32;                        // 2 (FP8 k=32)
+  static_assert(NT_PER_WARP_XV >= 1, "V chunk too narrow for this math-warp count");
+};
+
+// MXFP8 keeps the DSV4 64-D PV scheduling tile while applying two independent
+// g32 scales inside it, avoiding a doubled outer loop and barrier count.
+template <int TILE_BI, int TILE_MATH_WARPS>
+struct ComputeTraits<ModelType::DSV4_MXFP8, ComputeMode::FP8, TILE_BI, TILE_MATH_WARPS> {
+  using KV = KVCacheTraits<ModelType::DSV4_MXFP8>;
+  static constexpr int V_CHUNK = 64;
+  static constexpr int N_V_CHUNKS = KV::D_NOPE / V_CHUNK;
+  static constexpr int SCALE_GROUPS_PER_V_CHUNK = 2;
+  static constexpr int V_TRANS_STRIDE = TILE_BI + 16;
+  static constexpr int W_FP8_STRIDE = TILE_BI + 16;
+  static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / TILE_MATH_WARPS;
+  static constexpr int ACC_TILES = N_V_CHUNKS * NT_PER_WARP_XV;
+  static constexpr int XV_KSTEPS = TILE_BI / 32;
   static_assert(NT_PER_WARP_XV >= 1, "V chunk too narrow for this math-warp count");
 };
 
