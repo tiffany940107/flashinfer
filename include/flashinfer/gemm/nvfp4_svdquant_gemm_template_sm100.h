@@ -29,7 +29,9 @@
 #undef __CUDA_NO_HALF2_OPERATORS__
 #undef __CUDA_NO_BFLOAT162_OPERATORS__
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <type_traits>
 
@@ -62,6 +64,7 @@ using LayoutC = cutlass::layout::RowMajor;
 static constexpr int AlignA = 32;
 static constexpr int AlignB = 32;
 static constexpr int AlignC = 8;
+static constexpr int Store256AlignD = 256 / cutlass::sizeof_bits<OutElementType>::value;
 
 using EpilogueTileType = cutlass::epilogue::collective::EpilogueTileAuto;
 
@@ -74,18 +77,19 @@ using FusionOperation =
 // Every kernel shape uses a dynamic cluster type so each tile can benchmark stock-compatible
 // runtime cluster shapes without multiplying the generated kernel variants.
 template <class MmaTileShape_, class EpilogueSchedule_, class MainloopSchedule_,
-          class EpilogueTile_ = EpilogueTileType>
+          class EpilogueTile_ = EpilogueTileType, int AlignD_ = AlignC>
 struct SvdquantGemmConfig {
   using MmaTileShape = MmaTileShape_;
   using EpilogueTile = EpilogueTile_;
   using EpilogueSchedule = EpilogueSchedule_;
   using MainloopSchedule = MainloopSchedule_;
   using ClusterShape = Shape<int, int, _1>;
+  static constexpr int AlignD = AlignD_;
 
   using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       Arch, cutlass::arch::OpClassTensorOp, MmaTileShape, ClusterShape, EpilogueTile,
       ElementAccumulator, ElementCompute, ElementC, LayoutC, AlignC, OutElementType, LayoutC,
-      AlignC, EpilogueSchedule, FusionOperation>::CollectiveOp;
+      AlignD, EpilogueSchedule, FusionOperation>::CollectiveOp;
 
   // Build the standard block-scaled mainloop, then re-instantiate CollectiveMmaLoRA with the
   // builder's extracted template arguments. D/L1 overlay the residual A/B stage buffers, so no
@@ -140,6 +144,42 @@ using Tactic2Sm256x128x256Config =
 using Tactic2Sm256x256x256Config =
     SvdquantGemmConfig<Shape<_256, _256, _256>, cutlass::epilogue::TmaWarpSpecialized2Sm,
                        cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100, Shape<_128, _64>>;
+
+// Aligned direct-store variants keep the same LinCombPerColBias callback as the incumbent TMA
+// epilogue while bypassing shared-memory staging. The launcher retains the TMA variants for
+// devices other than SM100 and for outputs that do not satisfy the 32-byte base/stride contract.
+using Store256Tactic1Sm128x256x128Config =
+    SvdquantGemmConfig<Shape<_128, _256, _128>, cutlass::epilogue::NoSmemWarpSpecialized1Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100, EpilogueTileType,
+                       Store256AlignD>;
+using Store256Tactic2Sm256x256x128Config =
+    SvdquantGemmConfig<Shape<_256, _256, _128>, cutlass::epilogue::NoSmemWarpSpecialized2Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100, EpilogueTileType,
+                       Store256AlignD>;
+using Store256Tactic1Sm128x128x128Config =
+    SvdquantGemmConfig<Shape<_128, _128, _128>, cutlass::epilogue::NoSmemWarpSpecialized1Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100, EpilogueTileType,
+                       Store256AlignD>;
+using Store256Tactic2Sm256x192x128Config =
+    SvdquantGemmConfig<Shape<_256, _192, _128>, cutlass::epilogue::NoSmemWarpSpecialized2Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100, EpilogueTileType,
+                       Store256AlignD>;
+using Store256Tactic1Sm128x64x128Config =
+    SvdquantGemmConfig<Shape<_128, _64, _128>, cutlass::epilogue::NoSmemWarpSpecialized1Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100, EpilogueTileType,
+                       Store256AlignD>;
+using Store256Tactic1Sm128x128x256Config =
+    SvdquantGemmConfig<Shape<_128, _128, _256>, cutlass::epilogue::NoSmemWarpSpecialized1Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100, EpilogueTileType,
+                       Store256AlignD>;
+using Store256Tactic2Sm256x128x256Config =
+    SvdquantGemmConfig<Shape<_256, _128, _256>, cutlass::epilogue::NoSmemWarpSpecialized2Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100, EpilogueTileType,
+                       Store256AlignD>;
+using Store256Tactic2Sm256x256x256Config =
+    SvdquantGemmConfig<Shape<_256, _256, _256>, cutlass::epilogue::NoSmemWarpSpecialized2Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100, Shape<_128, _64>,
+                       Store256AlignD>;
 
 enum class KernelShape {
   k1Sm128x256x128,
@@ -297,6 +337,31 @@ void run_tactic(void* out, void const* A, void const* B, void const* sfa, void c
   if (st != cutlass::Status::kSuccess) throw std::runtime_error("nvfp4_svdquant_gemm: run failed");
 }
 
+inline bool is_store256_output_aligned(void const* out, int n) {
+  constexpr std::uintptr_t kStoreAlignmentBytes = 32;
+  return out != nullptr && reinterpret_cast<std::uintptr_t>(out) % kStoreAlignmentBytes == 0 &&
+         static_cast<std::uintptr_t>(n) * sizeof(OutElementType) % kStoreAlignmentBytes == 0;
+}
+
+template <class TmaConfig, class Store256Config>
+size_t workspace_size_for_tactic_pair(int m, int n, int k, RuntimeTactic const& tactic) {
+  return std::max(workspace_size_for_tactic<TmaConfig>(m, n, k, tactic),
+                  workspace_size_for_tactic<Store256Config>(m, n, k, tactic));
+}
+
+template <class TmaConfig, class Store256Config>
+void run_tactic_pair(void* out, void const* A, void const* B, void const* sfa, void const* sfb,
+                     float const* alpha, void const* D, void const* L1, void const* bias, int m,
+                     int n, int k, int lora_rank, char* ws, size_t wsBytes, cudaStream_t stream,
+                     RuntimeTactic const& tactic, bool enable_pdl, bool enable_store256) {
+  if (enable_store256 && is_store256_output_aligned(out, n)) {
+    return run_tactic<Store256Config>(out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank,
+                                      ws, wsBytes, stream, tactic, enable_pdl);
+  }
+  return run_tactic<TmaConfig>(out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws,
+                               wsBytes, stream, tactic, enable_pdl);
+}
+
 #define INSTANTIATE_NVFP4_SVDQUANT_GEMM_TACTIC(Config)                                           \
   template size_t workspace_size_for_tactic<Config>(int m, int n, int k,                         \
                                                     RuntimeTactic const& tactic);                \
@@ -325,6 +390,14 @@ EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic1Sm128x64x128Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic1Sm128x128x256Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic2Sm256x128x256Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic2Sm256x256x256Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic1Sm128x256x128Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic2Sm256x256x128Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic1Sm128x128x128Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic2Sm256x192x128Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic1Sm128x64x128Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic1Sm128x128x256Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic2Sm256x128x256Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic2Sm256x256x256Config)
 
 }  // namespace svdquant_detail
 }  // namespace gemm

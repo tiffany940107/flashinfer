@@ -145,7 +145,8 @@ def gen_gemm_sm100_module_cutlass_nvfp4_svdquant() -> JitSpec:
         jit_env.FLASHINFER_CSRC_DIR / "nvfp4_svdquant_gemm_cutlass_sm100.jinja"
     ) as f:
         kernel_inst_templ = jinja2.Template(f.read())
-        # One TU per kernel shape (27 runtime tactics = 8 shapes x dynamic clusters).
+        # One TU per kernel shape/epilogue pair. Aligned SM100 outputs use direct
+        # Store256 kernels; the original TMA variants remain the runtime fallback.
         config_list = [
             "Tactic1Sm128x256x128Config",
             "Tactic2Sm256x256x128Config",
@@ -155,6 +156,14 @@ def gen_gemm_sm100_module_cutlass_nvfp4_svdquant() -> JitSpec:
             "Tactic1Sm128x128x256Config",
             "Tactic2Sm256x128x256Config",
             "Tactic2Sm256x256x256Config",
+            "Store256Tactic1Sm128x256x128Config",
+            "Store256Tactic2Sm256x256x128Config",
+            "Store256Tactic1Sm128x128x128Config",
+            "Store256Tactic2Sm256x192x128Config",
+            "Store256Tactic1Sm128x64x128Config",
+            "Store256Tactic1Sm128x128x256Config",
+            "Store256Tactic2Sm256x128x256Config",
+            "Store256Tactic2Sm256x256x256Config",
         ]
         for config in config_list:
             dest_path = gen_directory / f"nvfp4_svdquant_gemm_cutlass_{config}.cu"
