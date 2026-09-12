@@ -91,6 +91,10 @@ size_t nvfp4_svdquant_gemm_workspace_size(int m, int n, int k, int tactic) {
       return svdquant_detail::workspace_size_for_tactic_pair<
           svdquant_detail::Tactic1Sm128x128x256Config,
           svdquant_detail::Store256Tactic1Sm128x128x256Config>(m, n, k, runtime_tactic);
+    case KernelShape::k2Sm256x192x256:
+      return svdquant_detail::workspace_size_for_tactic_pair<
+          svdquant_detail::Tactic2Sm256x192x256Config,
+          svdquant_detail::Store256Tactic2Sm256x192x256Config>(m, n, k, runtime_tactic);
     case KernelShape::k2Sm256x128x256:
       return svdquant_detail::workspace_size_for_tactic_pair<
           svdquant_detail::Tactic2Sm256x128x256Config,
@@ -140,6 +144,11 @@ void nvfp4_svdquant_gemm_run(void* out, void const* A, void const* B, void const
     case KernelShape::k1Sm128x128x256:
       return svdquant_detail::run_tactic_pair<svdquant_detail::Tactic1Sm128x128x256Config,
                                               svdquant_detail::Store256Tactic1Sm128x128x256Config>(
+          out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
+          runtime_tactic, enable_pdl, enable_store256);
+    case KernelShape::k2Sm256x192x256:
+      return svdquant_detail::run_tactic_pair<svdquant_detail::Tactic2Sm256x192x256Config,
+                                              svdquant_detail::Store256Tactic2Sm256x192x256Config>(
           out, A, B, sfa, sfb, alpha, D, L1, bias, m, n, k, lora_rank, ws, wsBytes, stream,
           runtime_tactic, enable_pdl, enable_store256);
     case KernelShape::k2Sm256x128x256:

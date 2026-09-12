@@ -154,6 +154,7 @@ def gen_gemm_sm100_module_cutlass_nvfp4_svdquant() -> JitSpec:
             "Tactic2Sm256x192x128Config",
             "Tactic1Sm128x64x128Config",
             "Tactic1Sm128x128x256Config",
+            "Tactic2Sm256x192x256Config",
             "Tactic2Sm256x128x256Config",
             "Tactic2Sm256x256x256Config",
             "Store256Tactic1Sm128x256x128Config",
@@ -162,6 +163,7 @@ def gen_gemm_sm100_module_cutlass_nvfp4_svdquant() -> JitSpec:
             "Store256Tactic2Sm256x192x128Config",
             "Store256Tactic1Sm128x64x128Config",
             "Store256Tactic1Sm128x128x256Config",
+            "Store256Tactic2Sm256x192x256Config",
             "Store256Tactic2Sm256x128x256Config",
             "Store256Tactic2Sm256x256x256Config",
         ]

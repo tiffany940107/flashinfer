@@ -138,6 +138,9 @@ using Tactic1Sm128x64x128Config =
 using Tactic1Sm128x128x256Config =
     SvdquantGemmConfig<Shape<_128, _128, _256>, cutlass::epilogue::TmaWarpSpecialized1Sm,
                        cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100>;
+using Tactic2Sm256x192x256Config =
+    SvdquantGemmConfig<Shape<_256, _192, _256>, cutlass::epilogue::TmaWarpSpecialized2Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100>;
 using Tactic2Sm256x128x256Config =
     SvdquantGemmConfig<Shape<_256, _128, _256>, cutlass::epilogue::TmaWarpSpecialized2Sm,
                        cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100>;
@@ -172,6 +175,10 @@ using Store256Tactic1Sm128x128x256Config =
     SvdquantGemmConfig<Shape<_128, _128, _256>, cutlass::epilogue::NoSmemWarpSpecialized1Sm,
                        cutlass::gemm::KernelTmaWarpSpecialized1SmNvf4Sm100, EpilogueTileType,
                        Store256AlignD>;
+using Store256Tactic2Sm256x192x256Config =
+    SvdquantGemmConfig<Shape<_256, _192, _256>, cutlass::epilogue::NoSmemWarpSpecialized2Sm,
+                       cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100, EpilogueTileType,
+                       Store256AlignD>;
 using Store256Tactic2Sm256x128x256Config =
     SvdquantGemmConfig<Shape<_256, _128, _256>, cutlass::epilogue::NoSmemWarpSpecialized2Sm,
                        cutlass::gemm::KernelTmaWarpSpecialized2SmNvf4Sm100, EpilogueTileType,
@@ -188,6 +195,7 @@ enum class KernelShape {
   k2Sm256x192x128,
   k1Sm128x64x128,
   k1Sm128x128x256,
+  k2Sm256x192x256,
   k2Sm256x128x256,
   k2Sm256x256x256,
 };
@@ -256,6 +264,18 @@ inline RuntimeTactic resolve_tactic(int tactic) {
       return {KernelShape::k1Sm128x128x256, dim3(1, 1, 1), dim3(1, 1, 1)};
     case Nvfp4SvdquantGemmTactic::k2Sm256x128x256Cluster2x2:
       return {KernelShape::k2Sm256x128x256, dim3(2, 2, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x192x256:
+      return {KernelShape::k2Sm256x192x256, dim3(2, 1, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x192x256Cluster2x2:
+      return {KernelShape::k2Sm256x192x256, dim3(2, 2, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x192x256Cluster2x4:
+      return {KernelShape::k2Sm256x192x256, dim3(2, 4, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x192x256Cluster4x1:
+      return {KernelShape::k2Sm256x192x256, dim3(4, 1, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x192x256Cluster4x2:
+      return {KernelShape::k2Sm256x192x256, dim3(4, 2, 1), dim3(2, 1, 1)};
+    case Nvfp4SvdquantGemmTactic::k2Sm256x192x256Cluster4x4:
+      return {KernelShape::k2Sm256x192x256, dim3(4, 4, 1), dim3(2, 1, 1)};
     default:
       throw std::invalid_argument("nvfp4_svdquant_gemm: invalid tactic");
   }
@@ -388,6 +408,7 @@ EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic1Sm128x128x128Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic2Sm256x192x128Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic1Sm128x64x128Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic1Sm128x128x256Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic2Sm256x192x256Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic2Sm256x128x256Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Tactic2Sm256x256x256Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic1Sm128x256x128Config)
@@ -396,6 +417,7 @@ EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic1Sm128x128x128Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic2Sm256x192x128Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic1Sm128x64x128Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic1Sm128x128x256Config)
+EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic2Sm256x192x256Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic2Sm256x128x256Config)
 EXTERN_NVFP4_SVDQUANT_GEMM_TACTIC(Store256Tactic2Sm256x256x256Config)
 
